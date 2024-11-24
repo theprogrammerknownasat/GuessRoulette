@@ -1,5 +1,6 @@
 import wifi
 import socketpool
+import random
 import time
 
 
@@ -45,7 +46,7 @@ class WiFiClient:
                         self.sock.connect(("192.168.4.1", 8080))
 
                         print("Sending ID...")
-                        id_msg = f"id {self.client_id}".encode()
+                        id_msg = f"id:{self.client_id}".encode()
                         self.sock.send(id_msg)
 
                         print("Waiting for response...")
@@ -97,29 +98,66 @@ class WiFiClient:
                 time.sleep(wait_time)
 
     def send(self, data):
+        """Send data to server and wait for 'ok' response."""
+        print(f"Sending to server: {data}")
         try:
             if not self.connected:
                 self._connect()
+                
+            # Ensure blocking mode for send/receive sequence
+            self.sock.setblocking(True)
+            
+            # Send the data
             self.sock.send(data.encode())
-            return True
+            
+            # Wait for acknowledgment
+            buffer = bytearray(1024)
+            bytes_read = self.sock.recv_into(buffer)
+            if bytes_read:
+                response = buffer[:bytes_read].decode()
+                if response.strip() == "ok":
+                    print("Server acknowledged")
+                    return True
+                else:
+                    print(f"Unexpected server response: {response}")
+                    return False
+            else:
+                print("No response from server")
+                return False
+            
         except Exception as e:
             print(f"Send failed: {e}")
             self.connected = False
             self._connect()
             return False
 
-    def receive(self):
+    def receive_from_server(self):
+        """Receive data from server and send back 'ok'."""
         try:
             if not self.connected:
                 self._connect()
+            self.sock.setblocking(False)
+
             buffer = bytearray(1024)
             bytes_read = self.sock.recv_into(buffer)
             if bytes_read:
-                return buffer[:bytes_read].decode()
+                data = buffer[:bytes_read].decode()
+                print(f"Received from server: {data}")
+
+                # Send back 'ok'
+                self.sock.setblocking(True)
+                self.sock.send(b"ok")
+                self.sock.setblocking(False)
+
+                return data
+        except OSError:
+            pass  # No data received
         except Exception as e:
             print(f"Receive failed: {e}")
             self.connected = False
             self._connect()
+        finally:
+            self.sock.setblocking(True)
         return None
 
     def close(self):
@@ -132,10 +170,18 @@ class WiFiClient:
 
 
 if __name__ == "__main__":
-    client = WiFiClient("PicoNet", "123456789", 1)
+    role = None
+    client = WiFiClient("GuessRoulette", "password", 1)
     try:
+        client.send("Hello from client")
         while True:
-            client.send("Hello from client")
-            time.sleep(2)
+            server_data = client.receive_from_server()
+            if server_data:
+                print(f"Data from server: {server_data}")
+            if server_data is not None and server_data.startswith("role"):
+                role = server_data.split(':')[1]
+                time.sleep(1)
+                client.send(f"pick:{random.randint(1, 100)}")
+            
     except KeyboardInterrupt:
         client.close()

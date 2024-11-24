@@ -128,8 +128,15 @@ class WiFiServer:
             conn.close()
 
     def _handle_data(self, client_id, data):
-        """Handle received data from clients"""
+        """Handle received data from clients and send back 'ok'"""
         print(f"Received from client {client_id}: {data}")
+        try:
+            conn, _ = self.clients[client_id]
+            conn.setblocking(True)
+            conn.send(b"ok")
+            conn.setblocking(False)
+        except Exception as e:
+            print(f"Error sending acknowledgment to client {client_id}: {e}")
 
     def _remove_client(self, client_id):
         """Remove a client from the connection pool"""
@@ -140,6 +147,31 @@ class WiFiServer:
         except Exception as e:
             print(f"Error removing client {client_id}: {e}")
         print(f"Client {client_id} disconnected")
+
+    def send_to_client(self, client_id, data):
+        """Send data to a specific client and wait for 'ok' back."""
+        try:
+            if client_id in self.clients:
+                conn, addr = self.clients[client_id]
+                conn.setblocking(True)
+                conn.send(data.encode())
+
+                buffer = bytearray(1024)
+                bytes_read = conn.recv_into(buffer)
+                if bytes_read:
+                    response = buffer[:bytes_read].decode()
+                    if response.strip() == "ok":
+                        print(f"Received 'ok' from client {client_id}")
+                    else:
+                        print(f"Unexpected response from client {client_id}: {response}")
+                else:
+                    print(f"No response from client {client_id}")
+
+                conn.setblocking(False)
+            else:
+                print(f"Client {client_id} not connected")
+        except Exception as e:
+            print(f"Error sending data to client {client_id}: {e}")
 
     def close(self):
         """Clean shutdown of server"""
@@ -160,6 +192,7 @@ if __name__ == "__main__":
     try:
         while True:
             server.update()
-            time.sleep(0.01)
+            time.sleep(1)
+            server.send_to_client(1, "Hello from server")
     except KeyboardInterrupt:
         server.close()
