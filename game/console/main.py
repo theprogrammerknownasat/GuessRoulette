@@ -1,3 +1,4 @@
+import asyncio
 import random
 import inspect
 import time
@@ -7,6 +8,7 @@ import socketpool
 import board
 import digitalio
 import rotaryio
+import pwmio
 
 
 class WiFiServer:
@@ -15,6 +17,7 @@ class WiFiServer:
         self.password = password
         self.max_clients = max_clients
         self.clients = {}
+        self.client_pin_association = {}
         self.running = True
         self.data_log = []
         self.game_instance = game_instance
@@ -44,6 +47,25 @@ class WiFiServer:
         self.client_sock.settimeout(0.1)
 
         print("Server listening on ports 80 (HTTP) and 8080 (Clients)...")
+
+        self.identification_pins = {
+            1: digitalio.DigitalInOut(board.GP16),
+            2: digitalio.DigitalInOut(board.GP17),
+            3: digitalio.DigitalInOut(board.GP18),
+            4: digitalio.DigitalInOut(board.GP19),
+            5: digitalio.DigitalInOut(board.GP20),
+            6: digitalio.DigitalInOut(board.GP21),
+            7: digitalio.DigitalInOut(board.GP22),
+            8: digitalio.DigitalInOut(board.GP26),
+            9: digitalio.DigitalInOut(board.GP27),
+            10: digitalio.DigitalInOut(board.GP28)
+        }
+
+        for pin in self.identification_pins.values():
+            pin.direction = digitalio.Direction.INPUT
+
+        self.identification_off = digitalio.DigitalInOut(board.GP11)
+        self.identification_off.direction = digitalio.Direction.OUTPUT
 
     def update(self, accepting_players=True):
         """Process connections and handle data"""
@@ -100,6 +122,15 @@ class WiFiServer:
                         self.clients[client_id] = (conn, addr)
                         print(f"Client {client_id} registered from {addr}")
                         conn.send(b"ok")
+                        time.sleep(0.01)
+                        conn.send(b"iden")
+                        buffer = bytearray(1024)
+                        bytes_read = conn.recv_into(buffer)
+                        if bytes_read:
+                            data = buffer[:bytes_read].decode()
+                            if data.strip() == "ok":
+                                print(f"Received 'ok' from client {client_id}")
+                                self._handle_identification(client_id)
                         conn.setblocking(False)
                     else:
                         print(f"Client {client_id} not allowed to join")
@@ -114,6 +145,48 @@ class WiFiServer:
         except Exception as e:
             print(f"New client connection error: {e}")
             conn.close()
+
+    def _handle_identification(self, client_id):
+
+        def reset_identification():
+            self.identification_off.value = True
+            time.sleep(0.1)
+            self.identification_off.value = False
+
+        active_pins = []
+        for pin_id, pin in self.identification_pins.items():
+            if pin.value:
+                active_pins.append(pin_id)
+
+        if len(active_pins) == 1:
+            active_pin = active_pins[0]
+            print(f"Active pin: {active_pin}")
+
+            # Associate the active pin with the client ID
+            self.send_to_client(client_id, f"iden:{active_pin}")
+            reset_identification()
+
+            # Store the association in the new dictionary
+            self.client_pin_association[client_id] = active_pin
+        else:
+            print("More than one pin is active")
+            while len(active_pins) > 1:
+                reset_identification()
+                active_pins = []
+                for pin_id, pin in self.identification_pins.items():
+                    if pin.value:
+                        active_pins.append(pin_id)
+
+                if len(active_pins) == 1:
+                    active_pin = active_pins[0]
+                    print(f"Active pin: {active_pin}")
+
+                    # Associate the active pin with the client ID
+                    self.send_to_client(client_id, f"iden:{active_pin}")
+                    reset_identification()
+                    # Store the association in the new dictionary
+                    self.client_pin_association[client_id] = active_pin
+                    break
 
     def send_to_client(self, client_id, data):
         """Send data to a specific client and wait for 'ok' back."""
@@ -186,6 +259,7 @@ class WiFiServer:
                 conn.close()
         except Exception as e:
             print(f"Error removing client {client_id}: {e}")
+        self.client_pin_association.pop(client_id, None)
         print(f"Client {client_id} disconnected")
 
     def get_data(self):
@@ -210,6 +284,54 @@ class WiFiServer:
         self.http_sock.close()
         self.client_sock.close()
         wifi.radio.stop_ap()
+
+
+class AudioMixer:
+    def __init__(self, pin_pos, pin_neg):
+        self.audio_pos = pwmio.PWMOut(pin_pos, duty_cycle=0, frequency=440, variable_frequency=True)
+        self.audio_neg = pwmio.PWMOut(pin_neg, duty_cycle=0, frequency=440, variable_frequency=True)
+        self.max_duty = 65536
+
+    async def play_tone(self, frequencies):
+        if not frequencies:
+            self.audio_pos.duty_cycle = 0
+            self.audio_neg.duty_cycle = 0
+            return
+
+        # Mix frequencies as before
+        mixed_duty = sum(self.max_duty // 2 for _ in frequencies) // len(frequencies)
+        freq = round(max(frequencies))
+
+        # Output mixed signal differentially
+        self.audio_pos.frequency = freq
+        self.audio_neg.frequency = freq
+        self.audio_pos.duty_cycle = mixed_duty
+        self.audio_neg.duty_cycle = self.max_duty - mixed_duty  # Inverted signal
+
+    async def play_tracks(self, tracks):
+        start_time = time.monotonic()
+        active_freqs = []
+
+        # Find end time of longest track
+        end_time = max(track[-1][1] for track in tracks)
+
+        while (current_time := time.monotonic() - start_time) < end_time:
+            # Get active frequencies from all tracks at current time
+            active_freqs = []
+            for track in tracks:
+                # Find the current note in this track
+                for i, (freq, timestamp) in enumerate(track):
+                    if timestamp <= current_time:
+                        if i + 1 < len(track) and track[i + 1][1] > current_time:
+                            if freq > 0:
+                                active_freqs.append(freq)
+                            break
+
+            await self.play_tone(active_freqs)
+            await asyncio.sleep(0.01)  # Small delay for stability
+
+        self.audio_pos.duty_cycle = 0
+        self.audio_neg.duty_cycle = 0
 
 
 class PlayerState:
@@ -256,17 +378,22 @@ class Game:
         self.accepting_players = True
 
         self.lights = {
-            1: digitalio.DigitalInOut(board.GP16),
-            2: digitalio.DigitalInOut(board.GP17),
-            3: digitalio.DigitalInOut(board.GP18),
-            4: digitalio.DigitalInOut(board.GP19),
-            5: digitalio.DigitalInOut(board.GP20),
-            6: digitalio.DigitalInOut(board.GP21),
-            7: digitalio.DigitalInOut(board.GP22),
-            8: digitalio.DigitalInOut(board.GP26),
-            9: digitalio.DigitalInOut(board.GP27),
-            10: digitalio.DigitalInOut(board.GP28),
+            1: digitalio.DigitalInOut(board.GP0),
+            2: digitalio.DigitalInOut(board.GP1),
+            3: digitalio.DigitalInOut(board.GP2),
+            4: digitalio.DigitalInOut(board.GP3),
+            5: digitalio.DigitalInOut(board.GP4),
+            6: digitalio.DigitalInOut(board.GP5),
+            7: digitalio.DigitalInOut(board.GP6),
+            8: digitalio.DigitalInOut(board.GP7),
+            9: digitalio.DigitalInOut(board.GP8),
+            10: digitalio.DigitalInOut(board.GP9),
 
+        }
+
+        self.speaker = {
+            "pos": digitalio.DigitalInOut(board.GP17),
+            "neg": digitalio.DigitalInOut(board.GP16)
         }
 
         self.encoder = rotaryio.IncrementalEncoder(board.GP14, board.GP15)
@@ -281,6 +408,8 @@ class Game:
 
         self.start = digitalio.DigitalInOut(board.GP1)
         self.start.direction = digitalio.Direction.INPUT
+
+        self.audio = AudioMixer(board.GP2, board.GP3)
 
     def light_wheel(self, choice=None, double_choice=False):
         if not choice:
@@ -397,21 +526,42 @@ class Game:
                 else:
                     for client_id in self.server.clients.keys():
                         self.players.append(Player(client_id))
+                    for player in self.players:
+                        self.server.send_to_client(player.id, "start")
 
             if not self.accepting_players:
                 self.game()
+            else:
+                self.player_ring_lights()
 
             self.server.update(self.accepting_players)
             self.io()
             time.sleep(0.01)
 
+    def player_ring_lights(self):
+        for light_id, light in self.lights.items():
+            if light_id in self.server.client_pin_association.values():
+                light.value = True
+            else:
+                light.value = False
+
     def game(self):
+        # send dead role to dead players
+        for player in self.players:
+            if player.state == PlayerState.DEAD:
+                self.server.send_to_client(player.id, f"role:{PlayerState.DEAD}")
         # If there are less than 3 players living, end the game
         if len([player for player in self.players if player.state != PlayerState.DEAD]) < 3:
             winners = [player for player in self.players if player.state != PlayerState.DEAD]
-            for winner in winners:
+            if len(winners) == 2:
+                winner = max(winners, key=lambda player: player.health)
                 self.server.send_to_client(winner.id, "win")
-            time.sleep(60)
+                print(f"Player {winner.id} wins")
+            elif len(winners) == 1:
+                self.server.send_to_client(winners[0].id, "win")
+                print(f"Player {winners[0].id} wins")
+
+            time.sleep(15)
             if self.round < self.max_rounds:
                 self.reset_game()
             else:
@@ -546,12 +696,17 @@ class Game:
         diff_2 = abs(picker_num - guesser_2_num)
 
         for better in self.betters:
-            if abs(better.bet - picker_num) <= 10:
-                better.health += 10
-            elif abs(better.bet - picker_num) == 0:
-                better.health += picker_num
+            if better.bet == 0:
+                print(f"Better {better.id} did not bet")
             else:
-                pass
+                if abs(better.bet - picker_num) <= 10:
+                    better.health += 10
+                elif abs(better.bet - picker_num) == 0:
+                    better.health += picker_num
+                elif abs(better.bet - picker_num) <= 70:
+                    better.health -= abs(better.bet - picker_num)
+                else:
+                    pass
 
         if diff_1 > diff_2:
             self.players[self.guesser_ids[0]].health -= diff_1
@@ -564,6 +719,13 @@ class Game:
             print("Both guessers are equally close to the picker's number")
         else:
             print("Error calculating differences")
+
+        # send updated health to players
+        for player in self.players:
+            self.server.send_to_client(player.id, f"health:{player.health}")
+
+            if player.health <= 0:
+                player.state = PlayerState.DEAD
 
         print(f"Difference for Guesser 1: {diff_1}")
         print(f"Difference for Guesser 2: {diff_2}")
@@ -602,7 +764,6 @@ if __name__ == "__main__":
     game = Game()
     game.run()
 
-
 """
 Client number order:
 id:(client_id) -> server
@@ -615,6 +776,7 @@ role:3+2 -> guesser 2
 guesser 1 -> guess+1:number
 guesser 2 -> guess+2:number
 better -> bet+(better_id):number
+health:(health) -> health
 repeat
 win -> win
 (clear -> clear) | (exit -> exit)
