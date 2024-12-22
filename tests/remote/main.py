@@ -67,6 +67,7 @@ class GameTestServer:
                 while True:
                     try:
                         data = client.recv(1024).decode()
+                        time.sleep(0.05)
                         if not data:
                             print(f"Client {client_id} disconnected (no data)")
                             break

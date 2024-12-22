@@ -566,7 +566,7 @@ class Game:
                 self.reset_game()
             else:
                 for client_id in self.server.clients.keys():
-                    self.server.send_to_client(client_id, "exit")
+                    self.server.send_to_client(client_id, "off")
                 self.server.close()
                 self.running = False
                 exit(0)
@@ -779,6 +779,6 @@ better -> bet+(better_id):number
 health:(health) -> health
 repeat
 win -> win
-(clear -> clear) | (exit -> exit)
+(clear -> clear) | (off -> off)
 
 """

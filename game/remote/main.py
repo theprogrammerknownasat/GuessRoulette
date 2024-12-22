@@ -8,6 +8,7 @@ import random
 import time
 import rotaryio
 import pwmio
+import supervisor
 
 
 class WiFiClient:
@@ -390,13 +391,21 @@ class Controller:
         self.role_number = None
         self.guess_ready = False
 
+
+
+
         self.keywords = {
-            "exit": self.close(),
-            "clear": self.clear(),
-            "win": lambda: asyncio.run(self.win())
+            "exit": self.client.close,
+            "clear": self.clear,
+            "win": self._start_win,
+            "off": self.display.display_off,
+            "reset": supervisor.reload()
         }
 
-    def exit(self):
+    def _start_win(self):
+        asyncio.run(self.win())
+
+    def close(self):
         self.running = False
         self.client.close()
         self.display.clear()
@@ -567,7 +576,7 @@ class Controller:
                         print(f"Role not assigned, skipping data: {data}")
                         self.role = data
                 # check if data starts with any of the keywords
-                elif any(data.startswith(keyword) for keyword in self.keywords):
+                elif any(keyword in data for keyword in self.keywords):
                     self.keywords[data]()
                 else:
                     print(f"Unknown data: {data}")
