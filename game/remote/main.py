@@ -10,28 +10,23 @@ import rotaryio
 import pwmio
 import supervisor
 
+ID = 1
 
 class WiFiClient:
-    def __init__(self, ssid, password, client_id):
+    def __init__(self, ssid, password, client_id, leds):
+        self.leds = leds
         self.ssid = ssid
         self.password = password
         self.client_id = client_id
         self.sock = None
         self.connected = False
         
-
-        self.identification = None
-        self.iden_pin = digitalio.DigitalInOut(board.GP14)
-        self.iden_pin.direction = digitalio.Direction.OUTPUT
-        self.iden_pin.value = False
-
-        self.clear_iden_pin = digitalio.DigitalInOut(board.GP15)
-        self.clear_iden_pin.direction = digitalio.Direction.INPUT
-
         self._connect()
 
     def _connect(self):
         attempt = 0
+        self.leds["led0"].value = True
+        self.leds["led1"].value = True
         while True:
             try:
                 print("\nConnecting to WiFi...")
@@ -46,6 +41,7 @@ class WiFiClient:
 
                 print("Connected to WiFi!")
                 print("IP Address:", str(wifi.radio.ipv4_address))
+                self.leds["led0"].value = False
                 time.sleep(5)  # WiFi stabilization
 
                 print("\nConnecting to server...")
@@ -60,7 +56,7 @@ class WiFiClient:
                         self.sock.setblocking(True)
 
                         print("Initiating connection...")
-                        self.sock.connect(("192.168.1.180", 8080)) #192.168.4.1
+                        self.sock.connect(("192.168.137.1", 8080)) #192.168.4.1
 
                         print("Sending ID...")
                         id_msg = f"id:{self.client_id}".encode()
@@ -76,9 +72,8 @@ class WiFiClient:
                             if response == "ok":
                                 print("Connected to server!")
                                 self.sock.settimeout(None)  # Remove timeout
+                                self.leds["led1"].value = False
                                 self.connected = True
-
-                                self._handle_identification()
                                 return
                             else:
                                 print(f"Unexpected response: {response}")
@@ -115,48 +110,8 @@ class WiFiClient:
                 wait_time = min(attempt * 2, 10)
                 print(f"Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
-
-    def _handle_identification(self):
-        """Handle the identification process with the server"""
-        try:
-            print("Starting identification process...")
-            
-            # Initialize identification pins
-            self.iden_pin.value = False
-            buffer = bytearray(1024)
-            
-            # Wait for "iden" command
-            bytes_read = self.sock.recv_into(buffer)
-            if bytes_read:
-                response = buffer[:bytes_read].decode()
-                if response.strip() == "iden":
-                    print("Identification query received")
-                    # Set identification pin high
-                    self.iden_pin.value = True
-                    
-                    # Send acknowledgment
-                    print("Sending acknowledgment")
-                    self.sock.send(b"ok")
-                    
-                    # Wait for pin assignment
-                    buffer = bytearray(1024)
-                    bytes_read = self.sock.recv_into(buffer)
-                    if bytes_read:
-                        response = buffer[:bytes_read].decode()
-                        if response.startswith("iden:"):
-                            self.identification = response.split(":")[1]
-                            print(f"Identification received: {self.identification}")
-                                    
-                            return True
-                        
-            return False
-            
-        except Exception as e:
-            print(f"Identification error: {e}")
-            self.connected = False
-            return False
         
-    def send(self, data):
+    def send(self, data, max_retries=3, timeout=5):
         """Send data to server and wait for 'ok' response."""
         print(f"Sending to server: {data}")
         try:
@@ -169,20 +124,29 @@ class WiFiClient:
             # Send the data
             self.sock.send(data.encode())
 
-            # Wait for acknowledgment
+            retries = 0
             buffer = bytearray(1024)
-            bytes_read = self.sock.recv_into(buffer)
-            if bytes_read:
-                response = buffer[:bytes_read].decode()
-                if response.strip() == "ok":
-                    print("Server acknowledged")
-                    return True
-                else:
-                    print(f"Unexpected server response: {response}")
-                    return False
-            else:
-                print("No response from server")
-                return False
+            while retries < max_retries:
+                try:
+                    self.sock.settimeout(timeout)
+                    bytes_read = self.sock.recv_into(buffer)
+                    self.sock.settimeout(None)  # Reset timeout
+                    
+                    if bytes_read:
+                        response = buffer[:bytes_read].decode()
+                        if response.strip() == "ok":
+                            print("Server acknowledged")
+                            return True
+                        else:
+                            print(f"Unexpected server response: {response}")
+                            return False
+                except:
+                    print(f"Server timeout, attempt {retries + 1} of {max_retries}")
+                    retries += 1
+                    continue
+                    
+            print("Max retries reached - no response from server")
+            return False
 
         except Exception as e:
             print(f"Send failed: {e}")
@@ -268,6 +232,51 @@ class SevenSegmentDisplay:
         ]
         return patterns[digit] | (0b10000000 if decimal else 0)
     
+    @staticmethod
+    def get_letter_encoding(letter):
+        patterns = {
+            # Uppercase letters
+            'A': 0b01110111,
+            'C': 0b00111001,
+            'E': 0b01111001,
+            'F': 0b01110001,
+            'H': 0b01110110,
+            'I': 0b00000110,
+            'J': 0b00011110,
+            'L': 0b00111000,
+            'O': 0b00111111,
+            'P': 0b01110011,
+            'S': 0b01101101,
+            'U': 0b00111110,
+            
+            # Lowercase letters
+            'b': 0b01111100,
+            'c': 0b01011000,
+            'd': 0b01011110,
+            'h': 0b01110100,
+            'i': 0b00000100,
+            'n': 0b01010100,
+            'o': 0b01011100,
+            'r': 0b01010000,
+            't': 0b01111000,
+            'u': 0b00011100,
+            
+            # Space/blank
+            ' ': 0b00000000
+        }
+        return patterns.get(letter, 0b10000000)  # Returns DP only if character not found
+
+    def display_text(self, text):
+        # Convert text to uppercase and pad with spaces if needed
+        text = (text.upper() + "    ")[:4]
+        # Update display buffer with letter patterns
+        self.display_buffer = [
+            self.get_letter_encoding(text[0]),
+            self.get_letter_encoding(text[1]),
+            self.get_letter_encoding(text[2]),
+            self.get_letter_encoding(text[3])
+        ]
+    
     async def flash_decimals(self):
         """Flash all decimal points"""
         while True:
@@ -339,19 +348,21 @@ class PlayerState:
 
 class Controller:
     def __init__(self):
-        self.client = WiFiClient("Fios-2vFHS", "beam873tow87mice", 1)
         self.running = True
 
-        self.encoder0 = rotaryio.IncrementalEncoder(board.GP12, board.GP13)
+        self.encoder0 = rotaryio.IncrementalEncoder(board.GP13, board.GP12)
+        self.encoder0.position = 0
         self.encoder0_btn = digitalio.DigitalInOut(board.GP11)
         self.encoder0_counter = 0
 
-        self.encoder0_btn.direction = digitalio.Direction.INPUT
-        self.encoder0_btn.pull = digitalio.Pull.UP
-
-        self.encoder1 = rotaryio.IncrementalEncoder(board.GP8, board.GP9)
+        self.encoder1 = rotaryio.IncrementalEncoder(board.GP9, board.GP8)
+        self.encoder0.position = 0
         self.encoder1_btn = digitalio.DigitalInOut(board.GP7)
         self.encoder1_counter = 0
+
+        # pull up both encoder buttons
+        self.encoder0_btn.switch_to_input(pull=digitalio.Pull.UP)
+        self.encoder1_btn.switch_to_input(pull=digitalio.Pull.UP)
 
         self.buttons = {
             "encoder0_btn": self.encoder0_btn,
@@ -359,16 +370,18 @@ class Controller:
             "btn0": digitalio.DigitalInOut(board.GP21),
             "btn1": digitalio.DigitalInOut(board.GP20),
             "btn2": digitalio.DigitalInOut(board.GP19),
-            "btn3": digitalio.DigitalInOut(board.GP18),
+            "btn3": digitalio.DigitalInOut(board.GP18)
         }
 
         self.leds = {
-            "internal": digitalio.DigitalInOut(board.LED),
             "led0": digitalio.DigitalInOut(board.GP22),
             "led1": digitalio.DigitalInOut(board.GP26),
             "led2": digitalio.DigitalInOut(board.GP27),
-            "led3": digitalio.DigitalInOut(board.GP28),
+            "led3": digitalio.DigitalInOut(board.GP28)
         }
+
+        for led in self.leds.values():
+            led.direction = digitalio.Direction.OUTPUT
 
         # backup communication (unused)
         """self.comm = {
@@ -376,12 +389,14 @@ class Controller:
             "scl": digitalio.DigitalInOut(board.GP15)
         }"""
 
-        for led in self.leds.values():
-            led.direction = digitalio.Direction.OUTPUT
-
-        self.buttons["btn3"].direction = digitalio.Direction.INPUT
+        for button in self.buttons.values():
+            button.direction = digitalio.Direction.INPUT
 
         self.display = SevenSegmentDisplay()
+
+        asyncio.run(self.display_boot())
+
+        self.client = WiFiClient("GuessRoulette", "password123", ID, self.leds)
 
         self.display_flash = False
         self.display_health = True
@@ -391,16 +406,25 @@ class Controller:
         self.role_number = None
         self.guess_ready = False
 
-
-
-
         self.keywords = {
             "exit": self.client.close,
             "clear": self.clear,
             "win": self._start_win,
             "off": self.display.display_off,
-            "reset": supervisor.reload()
+            "reset": supervisor.reload
         }
+
+    async def display_boot(self):
+        self.display.display_text("PICO")
+        for led in self.leds.values():
+            led.value = True
+            await asyncio.sleep(0.1)
+        for led in self.leds.values():
+            led.value = False
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(1.2)
+        self.display.display_off()
+        self.display.clear()
 
     def _start_win(self):
         asyncio.run(self.win())
@@ -419,21 +443,32 @@ class Controller:
         last_heartbeat = time.monotonic()
 
         while self.running:
+                    
             current_time = time.monotonic()
-            if current_time - last_heartbeat >= 1.0:
+            if current_time - last_heartbeat >= 5.0:
                 try:
                     if self.client.connected:
                         self.client.sock.send(b"heartbeat")
-                    last_heartbeat = current_time
+                        self.client.sock.settimeout(4)
+                        buffer = bytearray(1024)
+                        bytes_read = self.client.sock.recv_into(buffer)
+                        if bytes_read:
+                            response = buffer[:bytes_read].decode()
+                            if response.strip() == "ok":
+                                print("Heartbeat acknowledged")
+                                last_heartbeat = current_time
+                            else:
+                                raise Exception("Unexpected heartbeat response")
+                        else:
+                            raise Exception("No heartbeat response")
+                    else:
+                        raise Exception("Client not connected")
                 except Exception as e:
                     print(f"Heartbeat failed: {e}")
                     self.display.display_off()
                     self.client.connected = False
                     self.client._connect()
                     self.display.display_on()
-
-            if self.client.clear_iden_pin.value:
-                self.client.clear_iden_pin.value = False
 
             try:
                 data = self.client.receive_from_server()
@@ -496,7 +531,7 @@ class Controller:
                 self.encoder0.position = 100
             self.display.display_number(self.encoder0_counter)
 
-        if self.buttons["btn3"].value:
+        if self.buttons["btn3"].value or self.buttons["btn0"].value:
             self.guess_ready = True
             self.display_flash = False
             self.display_health = True
@@ -527,7 +562,7 @@ class Controller:
             print("Game started")
         else:
             if not self.start:
-                print(f"Game not started, skipping data: {data}")
+                print(f"Game not started, skipping data: {data}") if "ok" not in data else None
             else:
                 if data.startswith("role:"):
                     try:
@@ -578,6 +613,8 @@ class Controller:
                 # check if data starts with any of the keywords
                 elif any(keyword in data for keyword in self.keywords):
                     self.keywords[data]()
+                elif "ok" in data:
+                    pass
                 else:
                     print(f"Unknown data: {data}")
 

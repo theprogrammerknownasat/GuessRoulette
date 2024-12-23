@@ -5,13 +5,96 @@ import array
 import math
 
 import wifi
+import busio
 import socketpool
 import board
 import digitalio
+import pulseio
 import rotaryio
 import pwmio
-import adafruit_ssd1306
+import adafruit_displayio_sh1106
+import displayio
 
+class Display:
+    def __init__(self):
+        displayio.release_displays()
+        
+        i2c = busio.I2C(scl=board.GP15, sda=board.GP14, frequency=400000)
+        display_bus = displayio.I2CDisplay(i2c, device_address=0x3C)
+        self.display = adafruit_displayio_sh1106.SH1106(display_bus, width=130, height=64, rotation=180)
+        self.current_group = None
+        
+    async def boot(self):
+        # Create bitmap
+        bitmap = displayio.Bitmap(130, 64, 2)
+        
+        byte_index = 0
+        with open("/images/boot", "r") as f:
+            for line in f:
+                # Split line into individual hex strings
+                hex_values = line.strip().split(',')
+                
+                for hex_str in hex_values:
+                    # Clean and validate hex string
+                    hex_str = hex_str.strip().strip("'").strip('"')
+                    if hex_str and hex_str != '0x':
+                        try:
+                            # Convert hex string to int, handling '0x' prefix
+                            byte = int(hex_str.replace('0x', ''), 16)
+                            
+                            # Calculate position
+                            x = (byte_index * 8) % 128
+                            y = (byte_index * 8) // 128
+                            
+                            # Set 8 bits
+                            for bit in range(8):
+                                if x + bit < 128:  # Boundary check
+                                    bitmap[x + bit, y] = (byte >> (7 - bit)) & 1
+                            
+                            byte_index += 1
+                            
+                            # Give system time occasionally
+                            if byte_index % 16 == 0:
+                                time.sleep(0.001)
+                                
+                        except ValueError as e:
+                            print(f"Invalid hex value: {hex_str}")
+                            continue
+        
+        palette = displayio.Palette(2)
+        palette[0] = 0x000000
+        palette[1] = 0xFFFFFF
+        
+        tile_grid = displayio.TileGrid(bitmap, pixel_shader=palette)
+        group = displayio.Group()
+        group.append(tile_grid)
+        self.current_group = group
+        self.display.root_group = group
+
+    def show_test_pattern(self):
+        """Show test pattern if image fails"""
+        bitmap = displayio.Bitmap(128, 64, 1)
+        palette = displayio.Palette(1)
+        palette[0] = 0xFFFFFF
+        
+        for x in range(128):
+            for y in range(64):
+                bitmap[x, y] = (x + y) % 2
+                
+        tile_grid = displayio.TileGrid(bitmap, pixel_shader=palette)
+        group = displayio.Group()
+        group.append(tile_grid)
+        self.display.root_group = group
+        
+    def update_status(self, text):
+        #self.status.text = text
+        pass
+        
+    def clear(self):
+        """Clear display"""
+        group = displayio.Group()
+        self.current_group = group
+        self.display.root_group = group
 
 class WiFiClient:
     def __init__(self, ssid, password, client_id):
@@ -20,15 +103,6 @@ class WiFiClient:
         self.client_id = client_id
         self.sock = None
         self.connected = False
-        
-
-        self.identification = None
-        self.iden_pin = digitalio.DigitalInOut(board.GP14)
-        self.iden_pin.direction = digitalio.Direction.OUTPUT
-        self.iden_pin.value = False
-
-        self.clear_iden_pin = digitalio.DigitalInOut(board.GP15)
-        self.clear_iden_pin.direction = digitalio.Direction.INPUT
 
         self._connect()
 
@@ -62,7 +136,10 @@ class WiFiClient:
                         self.sock.setblocking(True)
 
                         print("Initiating connection...")
-                        self.sock.connect(("192.168.1.180", 8080)) #192.168.4.1
+                        connected = False
+                        # try to connect to 192.168.137.1, and if that doesnt work, go to 169.254.104.12
+                        self.sock.connect(("192.168.137.1", 8080))
+
 
                         print("Sending ID...")
                         id_msg = f"id:{self.client_id}".encode()
@@ -188,304 +265,46 @@ class WiFiClient:
                 pass
         wifi.radio.stop_station()
 
-class AudioMixer:
-    def __init__(self, audio_pos, audio_neg):
-        self.audio_pos = audio_pos
-        self.audio_neg = audio_neg
-        self.sample_rate = 44100
-        self.max_duty = 65535
-
-    async def play_tone(self, frequencies):
-        if not frequencies:
-            self.audio_pos.duty_cycle = 0
-            self.audio_neg.duty_cycle = 0
-            return
-
-        # Generate one period of mixed waveform
-        samples = array.array('H', [0] * 100)
-        t = [i/len(samples) for i in range(len(samples))]
-        
-        # Mix sine waves
-        for i in range(len(samples)):
-            mixed = sum(math.sin(2 * math.pi * f * t[i]) for f in frequencies)
-            # Normalize and scale to PWM range
-            normalized = (mixed / len(frequencies) + 1) / 2
-            samples[i] = int(normalized * self.max_duty)
-
-        # Output differential signals
-        for sample in samples:
-            self.audio_pos.duty_cycle = sample
-            self.audio_neg.duty_cycle = self.max_duty - sample
-            await asyncio.sleep(1/(self.sample_rate * len(samples)))
-
-    async def play_tracks(self, tracks):
-        start_time = time.monotonic()
-        active_freqs = []
-
-        # Find end time of longest track
-        end_time = max(track[-1][1] for track in tracks)
-
-        while (current_time := time.monotonic() - start_time) < end_time:
-            # Get active frequencies from all tracks at current time
-            active_freqs = []
-            for track in tracks:
-                # Find the current note in this track
-                for i, (freq, timestamp) in enumerate(track):
-                    if timestamp <= current_time:
-                        if i + 1 < len(track) and track[i + 1][1] > current_time:
-                            if freq > 0:
-                                active_freqs.append(freq)
-                            break
-
-            await self.play_tone(active_freqs)
-            await asyncio.sleep(0.01)  # Small delay for stability
-
-        self.audio_pos.duty_cycle = 0
-        self.audio_neg.duty_cycle = 0
-
-    @staticmethod
-    def tracks():
-        return [[
-            (0.00, 0.000000),
-            (0.00, 0.000000),
-            (0.00, 0.000000),
-            (0.00, 0.000000),
-            (0.00, 0.000000),
-            (0.00, 0.000000),
-            (0.00, 0.000000),
-            (0.00, 0.000000),
-            (440.00, 0.000000),
-            (0.00, 0.187500),
-            (493.88, 0.187500),
-            (554.37, 0.375000),
-            (0.00, 0.377604),
-            (0.00, 0.593750),
-            (440.00, 0.593750),
-            (0.00, 0.781250),
-            (440.00, 0.781250),
-            (0.00, 0.968750),
-            (493.88, 0.968750),
-            (0.00, 1.187500),
-            (554.37, 1.187500),
-            (0.00, 1.406250),
-            (440.00, 1.406250),
-            (0.00, 1.593750),
-            (440.00, 1.593750),
-            (0.00, 1.781250),
-            (415.30, 1.781250),
-            (0.00, 1.968750),
-            (369.99, 1.968750),
-            (0.00, 2.187500),
-            (415.30, 2.187500),
-            (0.00, 2.375000),
-            (440.00, 2.375000),
-            (0.00, 2.531250),
-            (493.88, 2.531250),
-            (0.00, 2.750000),
-            (415.30, 2.750000),
-            (0.00, 2.937500),
-            (329.63, 2.937500),
-            (0.00, 3.125000),
-            (440.00, 3.125000),
-            (493.88, 3.312500),
-            (0.00, 3.313802),
-            (0.00, 3.500000),
-            (554.37, 3.500000),
-            (0.00, 3.656250),
-            (440.00, 3.687500),
-            (0.00, 3.872396),
-            (440.00, 3.875000),
-            (0.00, 4.062500),
-            (493.88, 4.062500),
-            (0.00, 4.250000),
-            (554.37, 4.250000),
-            (0.00, 4.468750),
-            (440.00, 4.468750),
-            (0.00, 4.656250),
-            (440.00, 4.656250),
-            (0.00, 4.843750),
-            (415.30, 4.843750),
-            (0.00, 5.062500),
-            (369.99, 5.062500),
-            (0.00, 5.218750),
-            (493.88, 5.218750),
-            (0.00, 5.468750),
-            (415.30, 5.468750),
-            (0.00, 5.625000),
-            (329.63, 5.625000),
-            (0.00, 5.812500),
-            (440.00, 5.843750),
-            (0.00, 6.250000),
-            (880.00, 6.281250),
-            (0.00, 6.468750),
-            (987.77, 6.468750),
-            (0.00, 6.687500),
-            (1108.73, 6.687500),
-            (0.00, 6.906250),
-            (880.00, 6.906250),
-            (0.00, 7.092448),
-            (880.00, 7.093750),
-            (0.00, 7.281250),
-            (987.77, 7.281250),
-            (0.00, 7.468750),
-            (1108.73, 7.468750),
-            (880.00, 7.687500),
-            (0.00, 7.688802),
-            (0.00, 7.875000),
-            (880.00, 7.875000),
-            (0.00, 8.059896),
-            (830.61, 8.062500),
-            (0.00, 8.250000),
-            (739.99, 8.250000),
-            (0.00, 8.468750),
-            (830.61, 8.468750),
-            (0.00, 8.656250),
-            (880.00, 8.656250),
-            (0.00, 8.843750),
-            (987.77, 8.843750),
-            (0.00, 9.031250),
-            (830.61, 9.031250),
-            (0.00, 9.250000),
-            (659.26, 9.250000),
-            (880.00, 9.437500),
-            (0.00, 9.441406),
-            (987.77, 9.593750),
-            (0.00, 9.600260),
-            (0.00, 9.812500),
-            (1108.73, 9.812500),
-            (0.00, 10.031250),
-            (880.00, 10.031250),
-            (0.00, 10.218750),
-            (880.00, 10.218750),
-            (0.00, 10.406250),
-            (987.77, 10.406250),
-            (0.00, 10.593750),
-            (1108.73, 10.593750),
-            (0.00, 10.750000),
-            (987.77, 10.750000),
-            (0.00, 10.937500),
-            (880.00, 10.937500),
-            (0.00, 11.125000),
-            (830.61, 11.125000),
-            (0.00, 11.312500),
-            (739.99, 11.312500),
-            (0.00, 11.500000),
-            (987.77, 11.500000),
-            (0.00, 11.687500),
-            (830.61, 11.687500),
-            (0.00, 11.875000),
-            (659.26, 11.875000),
-            (0.00, 12.093750),
-            (880.00, 12.093750),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 12.907552),
-            (0.00, 13.007552),
-        ],
-            [
-                (220.00, 0.375000),
-                (0.00, 0.968750),
-                (220.00, 1.187500),
-                (0.00, 1.781250),
-                (146.83, 1.968750),
-                (0.00, 2.375000),
-                (164.81, 2.750000),
-                (0.00, 3.312500),
-                (220.00, 3.500000),
-                (0.00, 4.093750),
-                (220.00, 4.250000),
-                (0.00, 4.843750),
-                (146.83, 5.062500),
-                (0.00, 5.468750),
-                (164.81, 5.468750),
-                (0.00, 5.625000),
-                (220.00, 5.843750),
-                (0.00, 6.250000),
-                (440.00, 6.687500),
-                (0.00, 7.312500),
-                (440.00, 7.500000),
-                (0.00, 8.062500),
-                (293.66, 8.250000),
-                (0.00, 8.875000),
-                (329.63, 9.031250),
-                (0.00, 9.670573),
-                (440.00, 9.843750),
-                (0.00, 10.406250),
-                (440.00, 10.593750),
-                (0.00, 11.125000),
-                (293.66, 11.281250),
-                (329.63, 11.656250),
-                (0.00, 11.682292),
-                (0.00, 11.875000),
-                (440.00, 12.093750),
-                (0.00, 12.906250),
-                (0.00, 13.006250),
-            ]]
-
 class Console:
     def __init__(self):
-        self.client = WiFiClient("GuessRoulette", "password123", 0)
-
-        self.identification_pins = {
-            1: digitalio.DigitalInOut(board.GP16),
-            2: digitalio.DigitalInOut(board.GP17),
-            3: digitalio.DigitalInOut(board.GP18),
-            4: digitalio.DigitalInOut(board.GP19),
-            5: digitalio.DigitalInOut(board.GP20),
-            6: digitalio.DigitalInOut(board.GP21),
-            7: digitalio.DigitalInOut(board.GP22),
-            8: digitalio.DigitalInOut(board.GP26),
-            9: digitalio.DigitalInOut(board.GP27),
-            10: digitalio.DigitalInOut(board.GP28)
-        }
-
-        for pin in self.identification_pins.values():
-            pin.direction = digitalio.Direction.INPUT
-
-        self.identification_off = digitalio.DigitalInOut(board.GP11)
-        self.identification_off.direction = digitalio.Direction.OUTPUT
+        self.display = Display()
 
         self.lights = {
             1: digitalio.DigitalInOut(board.GP0),
             2: digitalio.DigitalInOut(board.GP1),
             3: digitalio.DigitalInOut(board.GP2),
             4: digitalio.DigitalInOut(board.GP3),
-            5: digitalio.DigitalInOut(board.GP4),
-            6: digitalio.DigitalInOut(board.GP5),
+            5: digitalio.DigitalInOut(board.GP5),
+            6: digitalio.DigitalInOut(board.GP4),
             7: digitalio.DigitalInOut(board.GP6),
             8: digitalio.DigitalInOut(board.GP7),
             9: digitalio.DigitalInOut(board.GP8),
             10: digitalio.DigitalInOut(board.GP9)
         }
 
+        self.client_mapping = {
+            1: self.lights[1],
+            2: self.lights[2],
+            3: self.lights[3],
+            4: self.lights[4],
+            5: self.lights[5],
+            6: self.lights[6],
+            7: self.lights[7],
+            8: self.lights[8],
+            9: self.lights[9],
+            10: self.lights[10]
+        }
+
         for light in self.lights.values():
             light.direction = digitalio.Direction.OUTPUT
             light.value = True
             time.sleep(0.1)
+        for light in self.lights.values():
             light.value = False
-
-        self.speaker = {
-            "pos": digitalio.DigitalInOut(board.GP17),
-            "neg": digitalio.DigitalInOut(board.GP16)
-        }
+            time.sleep(0.1)
 
         self.start = digitalio.DigitalInOut(board.GP10)
         self.start.direction = digitalio.Direction.INPUT
-
-        # setup i2c bus for display with sda and scl on gpio14 and 15
-        i2c = board.I2C(14, 15)
-        self.display = adafruit_ssd1306.SSD1306_I2C(128, 32, i2c)
-
-        self.audio_pos = digitalio.DigitalInOut(board.GP12)
-        self.audio_neg = digitalio.DigitalInOut(board.GP13)
-
-        self.audio = AudioMixer(self.audio_pos, self.audio_neg)
 
         self.running = True
 
@@ -494,192 +313,139 @@ class Console:
 
         self.started = False
 
+        asyncio.run(self.startup())
+
     def light_wheel(self, choice=None, double_choice=False):
+        def spin_to_choice(target, initial_speed=0.02, skip_light=None):
+            speed = initial_speed
+            spins = 2  # Fixed number for consistent timing
+            do_fake = random.random() < 0.25 and not skip_light  # Only fake on first spin
+            
+            for spin in range(spins):
+                for light_id, light in self.lights.items():
+                    if light_id == skip_light:
+                        continue
+                        
+                    light.value = True
+                    time.sleep(speed)
+                    light.value = False
+                    
+                    if spin == spins - 1 and light_id == target - 1 and do_fake:
+                        light.value = True
+                        time.sleep(0.3)  # Brief fake pause
+                        light.value = False
+                        continue
+                        
+                    if spin == spins - 1 and light_id == target:
+                        light.value = True
+                        return
+                        
+                speed *= 2.2  # Faster exponential slowdown
+
+        self.turn_off_all_lights()
         if not choice:
             raise ValueError("No choice provided")
 
         if double_choice:
             if not isinstance(choice, list) or len(choice) != 2:
-                raise ValueError("Choice must be a list of two values when double_choice is True")
-
-            first_choice, second_choice = choice
-            times = random.randint(4, 10)
-            speed = 0.1
-
-            # First spin
-            for each in range(1, times + 1):
-                for light_id, light in self.lights.items():
-                    light.value = True
-                    time.sleep(speed)
-                    light.value = False
-
-                    if each == times and light_id == first_choice - 1:
-                        speed = 1
-                    elif each == times and light_id == first_choice:
-                        light.value = True
-                        break
-                if each < times - 5:
-                    speed = 0.1
-                else:
-                    speed = 0.1
-                if each < times - 3:
-                    speed = 0.3
-                elif each < times - 2:
-                    speed = 0.5
-                elif each < times - 1:
-                    speed = 0.8
-
-            # Second spin
-            times = random.randint(4, 10)
-            for each in range(1, times + 1):
-                for light_id, light in self.lights.items():
-                    if light_id != first_choice:
-                        light.value = True
-                    time.sleep(speed)
-                    if light_id != first_choice:
-                        light.value = False
-
-                    if each == times and light_id == second_choice - 1:
-                        speed = 1
-                    elif each == times and light_id == second_choice:
-                        light.value = True
-                        return
-                if each < times - 5:
-                    speed = 0.1
-                else:
-                    speed = 0.1
-                if each < times - 3:
-                    speed = 0.3
-                elif each < times - 2:
-                    speed = 0.5
-                elif each < times - 1:
-                    speed = 0.8
-
+                raise ValueError("Choice must be a list of two values")
+                
+            # First spin leaving light on
+            spin_to_choice(choice[0], initial_speed=0.02)
+            time.sleep(0.3)  # Quick pause between spins
+            
+            # Second spin skipping lit light
+            spin_to_choice(choice[1], initial_speed=0.02, skip_light=choice[0])
         else:
-            times = random.randint(4, 10)
-            speed = 0.1
+            spin_to_choice(choice, initial_speed=0.02)
 
-            for each in range(1, times + 1):
-                for light_id, light in self.lights.items():
-                    light.value = True
-                    time.sleep(speed)
-                    light.value = False
-
-                    if each == times and light_id == choice - 1:
-                        speed = 1
-                    elif each == times and light_id == choice:
-                        light.value = True
-                        return
-                if each < times - 5:
-                    speed = 0.1
-                else:
-                    speed = 0.1
-                if each < times - 3:
-                    speed = 0.3
-                elif each < times - 2:
-                    speed = 0.5
-                elif each < times - 1:
-                    speed = 0.8
+    async def startup(self):
+        """Handle startup sequence"""
+        # Show boot screen
+        await self.display.boot()
+        
+        # Initialize WiFi
+        self.client = WiFiClient("GuessRoulette", "password123", 0)
+        
+        # Once connected, clear screen
+        if self.client.connected:
+            self.display.clear()
 
 
     def turn_off_all_lights(self):
         for light in self.lights.values():
             light.value = False
 
-    def reset_identification(self):
-        self.identification_off.value = True
-        time.sleep(0.1)
-        self.identification_off.value = False
-
-    def handle_identification(self):
-
-        active_pins = []
-        for pin_id, pin in self.identification_pins.items():
-            if pin.value:
-                active_pins.append(pin_id)
-
-        if len(active_pins) == 1:
-            active_pin = active_pins[0]
-            print(f"Active pin: {active_pin}")
-
-            # Associate the active pin with the client ID
-            self.client.send("idin:{active_pin}")
-        elif len(active_pins) > 1:
-            print("More than one pin is active")
-            while len(active_pins) > 1:
-                self.reset_identification()
-                active_pins = []
-                for pin_id, pin in self.identification_pins.items():
-                    if pin.value:
-                        active_pins.append(pin_id)
-
-                if len(active_pins) == 1:
-                    active_pin = active_pins[0]
-                    print(f"Active pin: {active_pin}")
-
-                    # Associate the active pin with the client ID
-                    self.send(f"idin:{active_pin}")
-        else:
-            pass
-
 
     async def main(self):
         last_heartbeat = time.monotonic()
-
         while self.running:
             current_time = time.monotonic()
-            if current_time - last_heartbeat >= 1.0:
+            if current_time - last_heartbeat >= 5.0:
                 try:
                     if self.client.connected:
                         self.client.sock.send(b"heartbeat")
-                    last_heartbeat = current_time
+                        self.client.sock.settimeout(4)
+                        buffer = bytearray(1024)
+                        bytes_read = self.client.sock.recv_into(buffer)
+                        if bytes_read:
+                            response = buffer[:bytes_read].decode()
+                            if response.strip() == "ok":
+                                print("Heartbeat acknowledged")
+                                last_heartbeat = current_time
+                            else:
+                                raise Exception("Unexpected heartbeat response")
+                        else:
+                            raise Exception("No heartbeat response")
+                    else:
+                        raise Exception("Client not connected")
                 except Exception as e:
                     print(f"Heartbeat failed: {e}")
                     self.client.connected = False
                     self.client._connect()
-
-            self.handle_identification()
-
-            # recieve data, if data is recieved, process it
-            data = self.client.receive_from_server()
-            if data:
-                print(f"Data received: {data}")
-                if data.startswith("clients:"):
-                    self.clients = [int(x) for x in data.split(":")[1].strip("[]").split(",")]
-                    if "0" in self.clients:
-                        self.clients.remove("0")
-                    print(f"Clients: {self.clients}")
-                elif data.startswith("light_wheel:"):
-                    if "[" in data:
-                        self.choices = [int(x) for x in data.split(":")[1].strip("[]").split(",")]
-                        self.light_wheel(self.choices, double_choice=True)
+                # recieve data, if data is recieved, process it
+                data = self.client.receive_from_server()
+                if data:
+                    print(f"Data received: {data}")
+                    if data.startswith("clients:"):
+                        self.clients = [int(x) for x in data.split(":")[1].strip("[]").split(",")]
+                        if "0" in self.clients:
+                            self.clients.remove("0")
+                        print(f"Clients: {self.clients}")
+                    elif data.startswith("light_wheel:"):
+                        if "[" in data:
+                            self.choices = [int(x) for x in data.split(":")[1].strip("[]").split(",")]
+                            self.light_wheel(self.choices, double_choice=True)
+                            self.client.send("light_wheel:done")
+                        elif "off" in data:
+                            self.turn_off_all_lights()
+                        else:
+                            choice = int(data.split(":")[1])
+                            self.light_wheel(choice, double_choice=False)
+                    elif data.startswith("display:"):
+                        pass
+                    elif data.startswith("win"):
+                        self.win()
+                    elif "ok" in data:
+                        pass
                     else:
-                        choice = int(data.split(":")[1])
-                        self.light_wheel(choice, double_choice=False)
-                elif data.startswith("audio:"):
-                    pass
-                elif data.startswith("display:"):
-                    pass
-                elif data.startswith("win"):
-                    self.win()
-                elif data.startswith("rstidn"):
-                    self.reset_identification()
+                        print(f"Unknown data: {data}")
+
+
+                if not self.started:
+                    for client in self.clients:
+                        if int(client) in int(self.lights.keys()):
+                            self.lights[client].value = True
                 else:
-                    print(f"Unknown data: {data}")
+                    self.turn_off_all_lights()
 
 
-            if not self.started:
-                for client in self.clients:
-                    if int(client) in int(self.lights.keys()):
-                        self.lights[client].value = True
-            else:
-                self.turn_off_all_lights()
+                if self.start.value:
+                    self.turn_off_all_lights()
+                    self.started = True
+                    self.client.send("start")
 
-
-            if self.start.value:
-                self.turn_off_all_lights()
-                self.started = True
-                self.client.send("start")
+                await asyncio.sleep(0.1)
 
     def win(self):
         asyncio.run(self.audio.play_tracks(self.audio.tracks()))
@@ -691,11 +457,7 @@ class Console:
             time.sleep(0.5)
             self.turn_off_all_lights()
 
-
-
-
-"""
-clients: should return the PINS
-
-"""
-
+if __name__ == "__main__":
+    console = Console()
+    asyncio.run(console.main())
+    
