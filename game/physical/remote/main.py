@@ -4,8 +4,10 @@ import wifi
 import socketpool
 import board
 import digitalio
+import random
 import time
 import rotaryio
+import pwmio
 import supervisor
 import adafruit_minimqtt.adafruit_minimqtt as MQTT
 import json
@@ -18,7 +20,6 @@ DEBUG = False
 
 LIMITED = True
 
-
 class MQTTGameClient:
     def __init__(self, client_id, leds):
         self.leds = leds
@@ -28,13 +29,13 @@ class MQTTGameClient:
         self.callback = None
         self.ssid = "GuessRoulette"
         self.password = "password123"
-
+        
         # Turn on status LEDs
         self.leds["led0"].value = True  # WiFi status
         self.leds["led1"].value = True  # MQTT status
 
         self.last_ping = time.monotonic()
-
+        
         asyncio.run(self.connect())
 
     async def ping_loop(self):
@@ -45,7 +46,7 @@ class MQTTGameClient:
                     "id": self.client_id
                 }))
             await asyncio.sleep(5)  # Ping every 5 seconds
-
+        
     async def connect(self):
         while not self.connected:
             try:
@@ -67,8 +68,8 @@ class MQTTGameClient:
                     port=1883,
                     client_id=f"pico_{self.client_id}",
                     socket_pool=pool,
-                    socket_timeout=0.5,  # Socket timeout shortest
-                    keep_alive=10,  # Keep alive longest
+                    socket_timeout=0.5,    # Socket timeout shortest
+                    keep_alive=10,         # Keep alive longest
                 )
 
                 self.mqtt_client.on_connect = self.on_connect
@@ -110,7 +111,7 @@ class MQTTGameClient:
             }))
         except:
             pass  # Ignore errors when trying to send disconnect
-
+            
     def publish(self, topic, message, retain=False):
         if not self.connected:
             self.connect()
@@ -120,19 +121,20 @@ class MQTTGameClient:
         except Exception as e:
             if DEBUG: print(f"Publish failed: {e}")
             return False
-
+            
     def on_message(self, client, topic, message):
         try:
             if self.callback:
                 self.callback(topic, message)
         except Exception as e:
             if DEBUG: print(f"Message handling error: {e}")
-
+            
     def set_callback(self, callback):
         self.callback = callback
-
+        
     def check_messages(self):
         self.mqtt_client.loop(1.0)
+
 
 
 class SevenSegmentDisplay:
@@ -141,28 +143,28 @@ class SevenSegmentDisplay:
         # Pin mapping
         self.pins = {
             "ser": board.GP2,
-            "rck": board.GP4,
+            "rck": board.GP4, 
             "sck": board.GP3,
             "oe1": board.GP5,
             "oe2": board.GP6
         }
-
+        
         # Setup GPIO
         self.display = {
-            pin: digitalio.DigitalInOut(gpio)
+            pin: digitalio.DigitalInOut(gpio) 
             for pin, gpio in self.pins.items()
         }
-
+        
         # Configure outputs
         for pin in self.display.values():
             pin.direction = digitalio.Direction.OUTPUT
-
+            
         # Enable display (active low)
         self.display["oe1"].value = False
         self.display["oe2"].value = False
-
+        
         # Initialize buffers
-        self.display_buffer = [0] * 4
+        self.current_buffer = [0] * 4
         self.next_buffer = [0] * 4
 
         self.decimal_points = [False] * 4
@@ -183,10 +185,10 @@ class SevenSegmentDisplay:
             0b01111101,  # 6
             0b00000111,  # 7
             0b01111111,  # 8
-            0b01101111  # 9
+            0b01101111   # 9
         ]
         return patterns[digit] | (0b10000000 if decimal else 0)
-
+    
     @staticmethod
     def get_letter_encoding(letter):
         patterns = {
@@ -203,7 +205,7 @@ class SevenSegmentDisplay:
             'P': 0b01110011,
             'S': 0b01101101,
             'U': 0b00111110,
-
+            
             # Lowercase letters
             'b': 0b01111100,
             'c': 0b01011000,
@@ -215,7 +217,7 @@ class SevenSegmentDisplay:
             'r': 0b01010000,
             't': 0b01111000,
             'u': 0b00011100,
-
+            
             # Space/blank
             ' ': 0b00000000
         }
@@ -231,7 +233,7 @@ class SevenSegmentDisplay:
             self.get_letter_encoding(text[2]),
             self.get_letter_encoding(text[3])
         ]
-
+    
     async def flash_decimals(self):
         """Flash all decimal points"""
         while True:
@@ -253,14 +255,17 @@ class SevenSegmentDisplay:
     def display_number(self, number):
         if not (0 <= number <= 9999):
             raise ValueError("Number must be between 0000 and 9999")
-
+        
         # Convert number to digits and update buffer
-        self.display_buffer = [
+        new_buffer = [
             (number // 1000) % 10,
             (number // 100) % 10,
             (number // 10) % 10,
             number % 10
         ]
+        if new_buffer != self.display_buffer:
+            self.display_buffer = new_buffer
+            asyncio.run(self.refresh_display())
 
     async def refresh_display(self):
         while True:
@@ -273,10 +278,10 @@ class SevenSegmentDisplay:
                 # Latch data
                 self.display["rck"].value = False
                 self.display["rck"].value = True
-
+                
                 # Small delay between digits
                 await asyncio.sleep(0.002)
-            self.display_buffer = self.next_buffer.copy()
+            self.current_buffer = self.next_buffer.copy()
 
     def display_off(self):
         self.display["oe1"].value = True
@@ -294,14 +299,12 @@ class SevenSegmentDisplay:
         self.display["rck"].value = True
         self.display_buffer = [0, 0, 0, 0]
 
-
 class PlayerState(Enum):
     DEFAULT = 1
     PICKER = 2
     GUESSER = 3
     BETTER = 4
     DEAD = 5
-
 
 class Controller:
     def __init__(self):
@@ -311,12 +314,12 @@ class Controller:
         # Initialize display
         self.display = SevenSegmentDisplay()
         asyncio.run(self.display_boot())
-
+        
         # Initialize MQTT client
         self.client = MQTTGameClient(ID, self.leds)
 
         self.client.set_callback(self._on_mqtt_message)
-
+        
         # Game state
         self.display_flash = False
         self.display_health = True
@@ -335,7 +338,7 @@ class Controller:
         }
 
         self.ping_task = asyncio.create_task(self.client.ping_loop())
-
+    
     def start_win(self):
         asyncio.run(self._start_win())
 
@@ -421,17 +424,17 @@ class Controller:
         display_task = asyncio.create_task(self.display.refresh_display())
         flash_task = None
         last_heartbeat = time.monotonic()
-
+        
         try:
             while self.running:
                 current_time = time.monotonic()
                 if current_time - last_heartbeat >= 5.0:
                     if not self.client.connected:
-                        await self.client.connect()
+                        self.client.connect()
                     last_heartbeat = current_time
                 # Check MQTT messages
                 self.client.check_messages()
-
+                
                 # Update display based on state
                 if self.display_health:
                     if LIMITED:
@@ -439,23 +442,24 @@ class Controller:
                     else:
                         self.display.display_number(self.health)
 
+
                 if self.display_flash and not flash_task:
                     flash_task = asyncio.create_task(self.flash_display())
                 elif not self.display_flash and flash_task:
                     flash_task.cancel()
                     flash_task = None
                     self.display.decimal_points = [False] * 4
-
+                
                 # Handle input if active role
                 if self.role not in [PlayerState.DEFAULT, PlayerState.DEAD] and not self.guess_ready:
                     self.pick()
-
+                
                 await asyncio.sleep(0.001)
-
+                
         except Exception as e:
             if DEBUG: print(f"Main loop error: {e}")
         finally:
-            if flash_task:
+            if flash_task: 
                 flash_task.cancel()
             display_task.cancel()
             self.display.display_off()
@@ -467,13 +471,12 @@ class Controller:
         await asyncio.sleep(14)
         self.display_flash = False
 
-    @staticmethod
-    def _setup_led(pin):
+    def _setup_led(self, pin):
         """Setup LED pin as output"""
         led = digitalio.DigitalInOut(pin)
         led.direction = digitalio.Direction.OUTPUT
         return led
-
+    
     def close(self):
         self.display.display_off()
         self.running = False
@@ -484,9 +487,9 @@ class Controller:
         data = payload.get('data')
 
         handlers = {
-            "start": lambda _: setattr(self, "start", True),
-            "role": self._handle_role,
-            "health": self._handle_health,
+        "start": self.handle_start,
+        "role": self.handle_role,
+        "health": self.handle_health,
         }
 
         handler = handlers.get(msg_type)
@@ -539,7 +542,7 @@ class Controller:
         if callback:
             asyncio.create_task(self._button_handler(debouncer, callback))
         return debouncer
-
+    
     def _on_encoder0_btn(self):
         self._send_pick()
 
@@ -558,8 +561,7 @@ class Controller:
     def _on_btn3(self):
         self._send_pick()
 
-    @staticmethod
-    async def _button_handler(debouncer, callback):
+    async def _button_handler(self, debouncer, callback):
         while True:
             debouncer.update()
             if debouncer.fell:
