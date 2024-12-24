@@ -9,24 +9,41 @@ import time
 import rotaryio
 import pwmio
 import supervisor
+import adafruit_minimqtt.adafruit_minimqtt as MQTT
+import json
 
 ID = 1
 
-class WiFiClient:
-    def __init__(self, ssid, password, client_id, leds):
-        self.leds = leds
-        self.ssid = ssid
-        self.password = password
-        self.client_id = client_id
-        self.sock = None
-        self.connected = False
-        
-        self._connect()
+LIMITED = True
 
-    def _connect(self):
-        attempt = 0
-        self.leds["led0"].value = True
-        self.leds["led1"].value = True
+class MQTTGameClient:
+    def __init__(self, client_id, leds):
+        self.leds = leds
+        self.client_id = client_id
+        self.mqtt_client = None
+        self.connected = False
+        self.callback = None
+        self.ssid = "GuessRoulette"
+        self.password = "password123"
+        
+        # Turn on status LEDs
+        self.leds["led0"].value = True  # WiFi status
+        self.leds["led1"].value = True  # MQTT status
+
+        self.last_ping = time.monotonic()
+        
+        self.connect()
+
+    async def ping_loop(self):
+        while True:
+            if self.connected:
+                self.publish("game/server", json.dumps({
+                    "type": "ping",
+                    "id": self.client_id
+                }))
+            await asyncio.sleep(5)  # Ping every 5 seconds
+        
+    def connect(self):
         while True:
             try:
                 print("\nConnecting to WiFi...")
@@ -42,178 +59,117 @@ class WiFiClient:
                 print("Connected to WiFi!")
                 print("IP Address:", str(wifi.radio.ipv4_address))
                 self.leds["led0"].value = False
-                time.sleep(5)  # WiFi stabilization
-
-                print("\nConnecting to server...")
+                time.sleep(5)  # WiFi stabilizationa
                 pool = socketpool.SocketPool(wifi.radio)
+                print("Connecting to MQTT broker...")
 
-                for attempt_num in range(3):
-                    try:
-                        print(f"Connection attempt {attempt_num + 1}...")
-                        self.sock = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+                # Setup MQTT client
+                self.mqtt_client = MQTT.MQTT(
+                    broker="192.168.137.1",
+                    port=1883,
+                    client_id=f"pico_{self.client_id}",
+                    socket_pool=pool,
+                    socket_timeout=0.5,    # Socket timeout shortest
+                    keep_alive=15,         # Keep alive longest
+                )
 
-                        # Ensure the socket is in blocking mode
-                        self.sock.setblocking(True)
+                self.mqtt_client.on_connect = self.on_connect
+                self.mqtt_client.on_disconnect = self.on_disconnect
+                self.mqtt_client.on_message = self.on_message
 
-                        print("Initiating connection...")
-                        self.sock.connect(("192.168.137.1", 8080)) #192.168.4.1
-
-                        print("Sending ID...")
-                        id_msg = f"id:{self.client_id}".encode()
-                        self.sock.send(id_msg)
-
-                        print("Waiting for response...")
-                        self.sock.settimeout(5)
-
-                        buffer = bytearray(1024)
-                        bytes_read = self.sock.recv_into(buffer)
-                        if bytes_read:
-                            response = buffer[:bytes_read].decode()
-                            if response == "ok":
-                                print("Connected to server!")
-                                self.sock.settimeout(None)  # Remove timeout
-                                self.leds["led1"].value = False
-                                self.connected = True
-                                return
-                            else:
-                                print(f"Unexpected response: {response}")
-                        else:
-                            print("No response received")
-
-                        self.sock.close()
-                        self.sock = None
-                        time.sleep(2)
-
-                    except Exception as e:
-                        print(f"Attempt {attempt_num + 1} failed: {e}")
-                        if self.sock:
-                            try:
-                                self.sock.close()
-                            except:
-                                pass
-                            self.sock = None
-                        time.sleep(2)
-
-                raise RuntimeError("All connection attempts failed")
-
+                self.mqtt_client.connect()
+                print("Connected to MQTT broker")
+                return
             except Exception as e:
                 print(f"Connection failed: {e}")
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except:
-                        pass
-                self.sock = None
-                self.connected = False
 
-                attempt += 1
-                wait_time = min(attempt * 2, 10)
-                print(f"Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
+    def on_connect(self, client, userdata, flags, rc):
+        print(f"Connected with result code {rc}")
+        if rc == 0:
+            self.connected = True
+            self.leds["led1"].value = False
+            # Subscribe to topics
+            topics = [
+                f"game/client/{self.client_id}",
+                "game/broadcast",
+                "game/roles/#",
+                "game/health",
+            ]
+            for topic in topics:
+                client.subscribe(topic)
+
+            connect_payload = {"type": "connect", "id": self.client_id}
+            self.publish("game/server", json.dumps(connect_payload))
+
+    def on_disconnect(self, client, userdata, rc):
+        print(f"Disconnected with result code {rc}")
+        self.connected = False
+        self.leds["led1"].value = True
+        # Send disconnect message before fully disconnecting
+        try:
+            self.publish("game/server", json.dumps({
+                "type": "disconnect",
+                "id": self.client_id
+            }))
+        except:
+            pass  # Ignore errors when trying to send disconnect
+            
+    def publish(self, topic, message, retain=False):
+        if not self.connected:
+            self.connect()
+        try:
+            print(f"Publishing to {topic}: {message}")
+            self.mqtt_client.publish(topic, message, retain=False, qos=1)
+            return True
+        except Exception as e:
+            print(f"Publish failed: {e}")
+            return False
+            
+    def on_message(self, client, topic, message):
+        print(f"Received message on {topic}: {message}")
+        try:
+            if self.callback:
+                self.callback(topic, message)
+        except Exception as e:
+            print(f"Message handling error: {e}")
+            
+    def set_callback(self, callback):
+        self.callback = callback
         
-    def send(self, data, max_retries=3, timeout=5):
-        """Send data to server and wait for 'ok' response."""
-        print(f"Sending to server: {data}")
-        try:
-            if not self.connected:
-                self._connect()
+    def check_messages(self):
+        self.mqtt_client.loop(1.0)
 
-            # Ensure blocking mode for send/receive sequence
-            self.sock.setblocking(True)
-
-            # Send the data
-            self.sock.send(data.encode())
-
-            retries = 0
-            buffer = bytearray(1024)
-            while retries < max_retries:
-                try:
-                    self.sock.settimeout(timeout)
-                    bytes_read = self.sock.recv_into(buffer)
-                    self.sock.settimeout(None)  # Reset timeout
-                    
-                    if bytes_read:
-                        response = buffer[:bytes_read].decode()
-                        if response.strip() == "ok":
-                            print("Server acknowledged")
-                            return True
-                        else:
-                            print(f"Unexpected server response: {response}")
-                            return False
-                except:
-                    print(f"Server timeout, attempt {retries + 1} of {max_retries}")
-                    retries += 1
-                    continue
-                    
-            print("Max retries reached - no response from server")
-            return False
-
-        except Exception as e:
-            print(f"Send failed: {e}")
-            self.connected = False
-            self._connect()
-            return False
-
-    def receive_from_server(self):
-        """Receive data from server and send back 'ok'."""
-        try:
-            if not self.connected:
-                self._connect()
-            self.sock.setblocking(False)
-
-            buffer = bytearray(1024)
-            bytes_read = self.sock.recv_into(buffer)
-            if bytes_read:
-                data = buffer[:bytes_read].decode()
-                print(f"Received from server: {data}")
-
-                # Send back 'ok'
-                self.sock.setblocking(True)
-                self.sock.send(b"ok")
-                self.sock.setblocking(False)
-
-                return data
-        except OSError:
-            pass  # No data received
-        except Exception as e:
-            print(f"Receive failed: {e}")
-            self.connected = False
-            self._connect()
-        finally:
-            self.sock.setblocking(True)
-        return None
-
-    def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except:
-                pass
-        wifi.radio.stop_station()
 
 
 class SevenSegmentDisplay:
     def __init__(self):
-        # Initialize pins
-        self.display = {
-            "ser": digitalio.DigitalInOut(board.GP2),
-            "rck": digitalio.DigitalInOut(board.GP4),
-            "sck": digitalio.DigitalInOut(board.GP3),
-            "oe1": digitalio.DigitalInOut(board.GP5),
-            "oe2": digitalio.DigitalInOut(board.GP6),
+        """Initialize display hardware and buffers"""
+        # Pin mapping
+        self.pins = {
+            "ser": board.GP2,
+            "rck": board.GP4, 
+            "sck": board.GP3,
+            "oe1": board.GP5,
+            "oe2": board.GP6
         }
-
-        # Configure pins as outputs
+        
+        # Setup GPIO
+        self.display = {
+            pin: digitalio.DigitalInOut(gpio) 
+            for pin, gpio in self.pins.items()
+        }
+        
+        # Configure outputs
         for pin in self.display.values():
             pin.direction = digitalio.Direction.OUTPUT
-
-        # Enable outputs (active low)
+            
+        # Enable display (active low)
         self.display["oe1"].value = False
         self.display["oe2"].value = False
-
-        # Initialize display buffer
-        self.display_buffer = [0, 0, 0, 0]
-        self.decimal_points = [False, False, False, False]
+        
+        # Initialize buffers
+        self.display_buffer = [0] * 4
+        self.decimal_points = [False] * 4
 
     # Segment patterns for digits 0-9
     @staticmethod
@@ -345,76 +301,53 @@ class PlayerState:
     BETTER = 4
     DEAD = 5
 
-
 class Controller:
     def __init__(self):
         self.running = True
-
-        self.encoder0 = rotaryio.IncrementalEncoder(board.GP13, board.GP12)
-        self.encoder0.position = 0
-        self.encoder0_btn = digitalio.DigitalInOut(board.GP11)
-        self.encoder0_counter = 0
-
-        self.encoder1 = rotaryio.IncrementalEncoder(board.GP9, board.GP8)
-        self.encoder0.position = 0
-        self.encoder1_btn = digitalio.DigitalInOut(board.GP7)
-        self.encoder1_counter = 0
-
-        # pull up both encoder buttons
-        self.encoder0_btn.switch_to_input(pull=digitalio.Pull.UP)
-        self.encoder1_btn.switch_to_input(pull=digitalio.Pull.UP)
-
-        self.buttons = {
-            "encoder0_btn": self.encoder0_btn,
-            "encoder1_btn": self.encoder1_btn,
-            "btn0": digitalio.DigitalInOut(board.GP21),
-            "btn1": digitalio.DigitalInOut(board.GP20),
-            "btn2": digitalio.DigitalInOut(board.GP19),
-            "btn3": digitalio.DigitalInOut(board.GP18)
-        }
-
-        self.leds = {
-            "led0": digitalio.DigitalInOut(board.GP22),
-            "led1": digitalio.DigitalInOut(board.GP26),
-            "led2": digitalio.DigitalInOut(board.GP27),
-            "led3": digitalio.DigitalInOut(board.GP28)
-        }
-
-        for led in self.leds.values():
-            led.direction = digitalio.Direction.OUTPUT
-
-        # backup communication (unused)
-        """self.comm = {
-            "sda": digitalio.DigitalInOut(board.GP14),
-            "scl": digitalio.DigitalInOut(board.GP15)
-        }"""
-
-        for button in self.buttons.values():
-            button.direction = digitalio.Direction.INPUT
-
+        # Initialize hardware
+        self._setup_hardware()
+        # Initialize display
         self.display = SevenSegmentDisplay()
-
         asyncio.run(self.display_boot())
+        
+        # Initialize MQTT client
+        self.client = MQTTGameClient(ID, self.leds)
 
-        self.client = WiFiClient("GuessRoulette", "password123", ID, self.leds)
-
+        self.client.set_callback(self._on_mqtt_message)
+        
+        # Game state
         self.display_flash = False
         self.display_health = True
         self.role = PlayerState.DEFAULT
-        self.health = 100
+        self.health = 100 if not LIMITED else 15
         self.start = False
         self.role_number = None
         self.guess_ready = False
 
         self.keywords = {
-            "exit": self.client.close,
-            "clear": self.clear,
-            "win": self._start_win,
+            "exit": self.close,
+            "clear": self.display.clear,
+            "win": self.start_win,
             "off": self.display.display_off,
             "reset": supervisor.reload
         }
 
+        self.ping_task = asyncio.create_task(self.client.ping_loop())
+    
+    def start_win(self):
+        asyncio.run(self._start_win())
+
+    def _on_mqtt_message(self, topic, message):
+        try:
+            # Parse incoming JSON
+            payload = json.loads(message)
+            # Pass payload to our game logic
+            self.process_server_data(payload)
+        except Exception as e:
+            print(f"JSON parse error: {e}")
+
     async def display_boot(self):
+        self.display.display_on()
         self.display.display_text("PICO")
         for led in self.leds.values():
             led.value = True
@@ -426,81 +359,32 @@ class Controller:
         self.display.display_off()
         self.display.clear()
 
-    def _start_win(self):
-        asyncio.run(self.win())
+    def _setup_hardware(self):
+        # Setup encoders
+        self.encoder0 = rotaryio.IncrementalEncoder(board.GP13, board.GP12)
+        self.encoder1 = rotaryio.IncrementalEncoder(board.GP9, board.GP8)
+        self.encoder0.position = 0
+        self.encoder1.position = 0
+        self.encoder0_counter = 0
+        self.encoder1_counter = 0
 
-    def close(self):
-        self.running = False
-        self.client.close()
-        self.display.clear()
-        self.display.display_off()
+        # Setup buttons
+        self.buttons = {
+            "encoder0_btn": self._setup_button(board.GP11, True),
+            "encoder1_btn": self._setup_button(board.GP7, True),
+            "btn0": self._setup_button(board.GP21),
+            "btn1": self._setup_button(board.GP20),
+            "btn2": self._setup_button(board.GP19),
+            "btn3": self._setup_button(board.GP18)
+        }
 
-    async def main(self):
-        self.display.display_on()
-
-        display_task = asyncio.create_task(self.display.refresh_display())
-        self._flash_task = None
-        last_heartbeat = time.monotonic()
-
-        while self.running:
-                    
-            current_time = time.monotonic()
-            if current_time - last_heartbeat >= 5.0:
-                try:
-                    if self.client.connected:
-                        self.client.sock.send(b"heartbeat")
-                        self.client.sock.settimeout(4)
-                        buffer = bytearray(1024)
-                        bytes_read = self.client.sock.recv_into(buffer)
-                        if bytes_read:
-                            response = buffer[:bytes_read].decode()
-                            if response.strip() == "ok":
-                                print("Heartbeat acknowledged")
-                                last_heartbeat = current_time
-                            else:
-                                raise Exception("Unexpected heartbeat response")
-                        else:
-                            raise Exception("No heartbeat response")
-                    else:
-                        raise Exception("Client not connected")
-                except Exception as e:
-                    print(f"Heartbeat failed: {e}")
-                    self.display.display_off()
-                    self.client.connected = False
-                    self.client._connect()
-                    self.display.display_on()
-
-            try:
-                data = self.client.receive_from_server()
-
-                if data:
-                    self.process_server_data(data)
-
-                if self.role == PlayerState.DEAD:
-                    self.display.display_off()
-                    self.display_health = False
-                    self.display_flash = False
-
-                if self.display_health:
-                    self.display.display_number(self.health)
-
-                if self.display_flash and not self._flash_task:
-                    self._flash_task = asyncio.create_task(self.flash_display())
-                elif not self.display_flash and self._flash_task:
-                    self._flash_task.cancel()
-                    self._flash_task = None
-                
-
-                if (self.role is not None) and (self.role is not PlayerState.DEFAULT) and (
-                        self.role is not PlayerState.DEAD):
-                    if not self.guess_ready:
-                        self.display_flash = True
-                        self.pick()
-                
-                await asyncio.sleep(0.001)
-
-            except KeyboardInterrupt:
-                self.running = False
+        # Setup LEDs
+        self.leds = {
+            "led0": self._setup_led(board.GP22),
+            "led1": self._setup_led(board.GP26),
+            "led2": self._setup_led(board.GP27),
+            "led3": self._setup_led(board.GP28)
+        }
 
     async def flash_display(self):
         while self.display_flash:
@@ -510,113 +394,186 @@ class Controller:
             flash_task.cancel()
             self.display.decimal_points = [False, False, False, False]
 
+    async def main(self):
+        """Main game loop"""
+        self.display.display_on()
+        display_task = asyncio.create_task(self.display.refresh_display())
+        flash_task = None
+        last_heartbeat = time.monotonic()
+        
+        try:
+            while self.running:
+                current_time = time.monotonic()
+                if current_time - last_heartbeat >= 5.0:
+                    if not self.client.connected:
+                        self.client.connect()
+                    last_heartbeat = current_time
+                # Check MQTT messages
+                self.client.check_messages()
+                
+                # Update display based on state
+                if self.display_health:
+                    if LIMITED:
+                        self._display_binary(self.health)
+                    else:
+                        self.display.display_number(self.health)
 
-    def clear(self):
-        self.display_health = True
+
+                if self.display_flash and not flash_task:
+                    flash_task = asyncio.create_task(self.flash_display())
+                elif not self.display_flash and flash_task:
+                    flash_task.cancel()
+                    flash_task = None
+                    self.display.decimal_points = [False] * 4
+                
+                # Handle input if active role
+                if self.role not in [PlayerState.DEFAULT, PlayerState.DEAD] and not self.guess_ready:
+                    self.pick()
+                
+                await asyncio.sleep(0.01)
+                
+        except Exception as e:
+            print(f"Main loop error: {e}")
+        finally:
+            if flash_task: 
+                flash_task.cancel()
+            display_task.cancel()
+            self.display.display_off()
+            self.display.clear()
+            self.ping_task.cancel()
+
+    async def _start_win(self):
+        self.display_flash = True
+        await asyncio.sleep(14)
         self.display_flash = False
-        self.role = PlayerState.DEFAULT if self.role != PlayerState.DEAD else PlayerState.DEAD
-        self.start = False
-        self.role_number = None
-        self.guess_ready = False
 
-    def pick(self):
-        current_position = self.encoder0.position
-        if current_position != self.encoder0_counter:
-            self.encoder0_counter = current_position
-            if self.encoder0_counter < 0:
-                self.encoder0_counter = 0
-                self.encoder0.position = 0
-            elif self.encoder0_counter > 100:
-                self.encoder0_counter = 100
-                self.encoder0.position = 100
-            self.display.display_number(self.encoder0_counter)
+    def _setup_led(self, pin):
+        """Setup LED pin as output"""
+        led = digitalio.DigitalInOut(pin)
+        led.direction = digitalio.Direction.OUTPUT
+        return led
+    
+    def close(self):
+        self.display.display_off()
+        self.running = False
+        self.client.disconnect()
 
-        if self.buttons["btn3"].value or self.buttons["btn0"].value:
-            self.guess_ready = True
-            self.display_flash = False
-            self.display_health = True
-            if self.role == PlayerState.PICKER:
-                self.client.send(f"pick:{self.encoder0_counter}")
-            elif self.role == PlayerState.GUESSER:
-                self.client.send(f"guess+{self.role_number}:{self.encoder0_counter}")
-            elif self.role == PlayerState.BETTER:
-                self.client.send(f"bet+{self.role_number}:{self.encoder0_counter}")
+    def process_server_data(self, payload):
+        msg_type = payload.get('type')
+        data = payload.get('data')
 
-            self.encoder0_counter = 0
-            self.encoder0.position = 0
-            
-
-    async def win(self):
-        # Flash LEDs for 14 seconds
-        for _ in range(14):
-            for led in self.leds.values():
-                led.value = True
-            await asyncio.sleep(0.5)
-            for led in self.leds.values():
-                led.value = False
-            await asyncio.sleep(0.5)
-
-    def process_server_data(self, data):
-        if data.startswith("start"):
+        if msg_type == "start":
             self.start = True
             print("Game started")
-        else:
-            if not self.start:
-                print(f"Game not started, skipping data: {data}") if "ok" not in data else None
+        elif msg_type == "role":
+            self._handle_role(data)
+        elif msg_type == "health":
+            health_val = payload.get("health", None)
+            self._handle_health(health_val)
+        elif msg_type in self.keywords:
+            self.keywords[msg_type]()
+
+    def _handle_health(self, health_data):
+        if health_data is None:
+            return
+        try:
+            health = int(health_data)
+            if health <= 0:
+                health = 0
+                self.role = PlayerState.DEAD
+            self.health = health
+        except ValueError:
+            print("Invalid health value")
+
+    def _handle_role(self, role_data):
+        try:
+            if "+" in role_data:
+                role_type, designation = role_data.split("+")
+                if role_type == str(PlayerState.GUESSER):
+                    self.role = PlayerState.GUESSER
+                    self.role_number = designation
+                elif role_type == str(PlayerState.BETTER):
+                    self.role = PlayerState.BETTER
+                    self.role_number = designation
             else:
-                if data.startswith("role:"):
-                    try:
-                        role_number = None
-                        role_designation = None
-                        role = data.split(":")[1]
-                        print(f"Role data: {role}")
-                        if "+" in role:
-                            role_number = role.split("+")[0]
-                            role_designation = role.split("+")[1]
+                if role_data == str(PlayerState.PICKER):
+                    self.role = PlayerState.PICKER
+                elif role_data == str(PlayerState.DEAD):
+                    self.role = PlayerState.DEAD
 
-                            if "3" in role_number:
-                                self.role = PlayerState.GUESSER
-                                self.role_number = role_designation
-                            elif "4" in role_number:
-                                self.role = PlayerState.BETTER
-                                self.role_number = role_designation
-                        else:
-                            if "2" in role:
-                                self.role = PlayerState.PICKER
-                            elif "5" in role:
-                                self.role = PlayerState.DEAD
-                            else:
-                                print(f"Invalid role number: {role}")
+            self.guess_ready = False
+            self.display_health = False
+            self.display.display_number(0)
+            print(f"Received role: {self.role}")
+        except Exception as e:
+            print(f"Error handling role: {e}")
 
+    def _setup_button(self, pin, pullup=False):
+        """Setup button with optional pullup"""
+        button = digitalio.DigitalInOut(pin)
+        button.direction = digitalio.Direction.INPUT
+        if pullup:
+            button.pull = digitalio.Pull.UP
+        return button
 
-                        self.guess_ready = False
-                        self.display_health = False
-                        self.display.display_number(0)
-                        print(f"Received role: {self.role}")
-                        return
-                    except ValueError:
-                        print("Invalid role number format")
-                elif data.startswith("health:"):
-                    if (self.role is not None) or (self.role is not PlayerState.DEFAULT):
-                        try:
-                            health = int(data.split(":")[1])
-                            if health <= 0:
-                                health = 0
-                                self.role = PlayerState.DEAD
-                            self.health = health
-                            print(f"Received health: {health}")
-                        except ValueError:
-                            print("Invalid health format")
-                    else:
-                        print(f"Role not assigned, skipping data: {data}")
-                        self.role = data
-                # check if data starts with any of the keywords
-                elif any(keyword in data for keyword in self.keywords):
-                    self.keywords[data]()
-                elif "ok" in data:
-                    pass
-                else:
-                    print(f"Unknown data: {data}")
+    def pick(self):
+        """Handle encoder input and button presses for picking numbers"""
+        # Get encoder position changes
+        encoder_position = self.encoder0.position
+        if encoder_position > self.encoder0_counter:
+            self.encoder0_counter = min(100, self.encoder0_counter + 1) if not LIMITED else min(15, self.encoder0_counter + 1)
+            self.encoder0.position = self.encoder0_counter
+        elif encoder_position < self.encoder0_counter:
+            self.encoder0_counter = max(0, self.encoder0_counter - 1) if not LIMITED else max(0, self.encoder0_counter - 1)
+            self.encoder0.position = self.encoder0_counter
+        
+        # Update display with current counter value
+        if not self.display_health:
+            if LIMITED:
+                self._display_binary(self.encoder0_counter)
+            self.display.display_number(self.encoder0_counter)
+        
+        # Check for button press to confirm selection
+        print(self.buttons["btn3"].value, self.buttons["btn0"].value)
+        if self.buttons["btn3"].value or self.buttons["btn0"].value:
+            self._send_pick()
+
+    def _send_pick(self):
+        self.guess_ready = True
+        self.display_flash = False
+        self.display_health = True
+        
+        if self.role == PlayerState.PICKER:
+            self.client.publish("game/picker/response", json.dumps({
+                "type": "pick",
+                "data": self.encoder0_counter,
+                "id": ID
+            }))
+        elif self.role == PlayerState.GUESSER:
+            self.client.publish("game/guesser/response", json.dumps({
+                "type": "guess",
+                "data": self.encoder0_counter,
+                "id": ID,
+                "index": self.role_number
+            }))
+        elif self.role == PlayerState.BETTER:
+            self.client.publish("game/better/response", json.dumps({
+                "type": "bet",
+                "data": self.encoder0_counter,
+                "id": ID,
+                "index": self.role_number
+            }))
+
+        self.encoder0_counter = 0
+        self.encoder0.position = 0
+
+    def _display_binary(self, number):
+        """Display number in binary using LEDs"""
+        # Convert number to binary and pad to 4 bits
+        binary = f"{number:04b}"
+        # Update LEDs
+        for i, bit in enumerate(binary):
+            self.leds[f"led{i}"].value = (bit == '1')
 
 
 if __name__ == "__main__":

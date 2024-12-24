@@ -16,7 +16,10 @@ import random
 import math
 import winreg
 import queue
+import paho.mqtt.client as mqtt
+import asyncio
 
+LIMITED = True
 
 def is_admin():
     try:
@@ -62,32 +65,6 @@ def setup_wifi_peers_registry():
         sys.exit()
     
     winreg.CloseKey(key)
-
-
-class ClientHandler:
-    def __init__(self, client, client_id):
-        self.client = client
-        self.client_id = client_id
-        self.send_queue = queue.Queue()
-        self.send_lock = threading.Lock()
-        self.last_successful_comm = time.time()
-        
-    def send(self, data, max_retries=3):
-        with self.send_lock:
-            for attempt in range(max_retries):
-                try:
-                    self.client.settimeout(1.0)  # Short timeout for send
-                    self.client.send(data if isinstance(data, bytes) else data.encode())
-                    self.client.settimeout(2.0)  # Longer timeout for receive
-                    response = self.client.recv(1024).decode()
-                    if response.strip() == "ok":
-                        self.last_successful_comm = time.time()
-                        return True
-                except Exception as e:
-                    print(f"Send attempt {attempt + 1} failed: {e}") if attempt > 0 else None
-                    time.sleep(0.1)  # Brief delay between retries
-            return False
-
 
 class WiFiHotspot:
     def __init__(self):
@@ -185,6 +162,11 @@ class WiFiHotspot:
             # Start hotspot (errors suppressed)
             $null = $manager.StartTetheringAsync().AsTask().Wait()
             Write-Host "Started tethering"
+
+            New-NetFirewallRule -DisplayName "Mosquitto MQTT" -Direction Inbound -Protocol TCP -LocalPort 1883 -Action Allow
+
+            net stop mosquitto
+            net start mosquitto
             
             # Restore error preference
             $ErrorActionPreference = 'Continue'
@@ -213,17 +195,19 @@ class WiFiHotspot:
             return False
 
     def _test_network(self):
+        # Test network adapter
         ps_command = '''
         $network = Get-NetAdapter | Where-Object {$_.Name -like "*Local*"} | Select-Object Status
         Write-Host $network.Status
         '''
         result = subprocess.run(["powershell", "-Command", ps_command],
                                 capture_output=True, text=True)
-        if "Up" in result.stdout:
-            print("✓ Network is active")
-            return True
-        print("✗ Network is not active")
-        return False
+        if "Up" not in result.stdout:
+            print("✗ Network is not active")
+            return False
+        print("✓ Network is active")
+        return True
+
 
     def stop_hotspot(self):
         if not is_admin():
@@ -269,9 +253,10 @@ class WiFiHotspot:
 
 
 class GUI:
-    def __init__(self, gamestate, wifi):
+    def __init__(self, gamestate, wifi, server):
         self.state = gamestate
         self.wifi = wifi
+        self.server = server
 
         # Create main window
         self.root = tk.Tk()
@@ -325,6 +310,8 @@ class GUI:
         # Player count
         self.players_var = tk.StringVar(value="Players: 0")
         ttk.Label(status, textvariable=self.players_var).grid(row=0, column=2, padx=20)
+
+        ttk.Label(status, text="Limited Mode Enabled!", foreground="red").grid(row=0, column=3, padx=20) if LIMITED else None
 
         # Game Controls
         controls = ttk.LabelFrame(main, text="Game Controls", padding="5")
@@ -381,7 +368,7 @@ class GUI:
 
         # Status Bar
         status = ttk.LabelFrame(main, text="Server Status", padding="5")
-        status.grid(row=0, column=0, columnspan=4, sticky="ew", pady=5)
+        status.grid(row=0, column=0, columnspan=5, sticky="ew", pady=5)
 
         self.console_frame = ttk.Frame(status)
         self.console_frame.grid(row=0, column=0, sticky="w", padx=5)
@@ -397,6 +384,8 @@ class GUI:
         # Player count
         self.players_var = tk.StringVar(value="Players: 0")
         ttk.Label(status, textvariable=self.players_var).grid(row=0, column=4, padx=20)
+
+        ttk.Label(status, text="Limited Mode Enabled!", foreground="red").grid(row=0, column=5, padx=20) if LIMITED else None
 
         # Client Section
         clients = ttk.LabelFrame(main, text="Connected Clients", padding="5")
@@ -432,6 +421,8 @@ class GUI:
         style = ttk.Style()
         style.configure('Treeview', rowheight=25)
 
+        ttk.Button(clients, text="Refresh", command=self.update_client_list).grid(row=1, column=0, pady=5)
+
         # Game Control Section
         controls = ttk.LabelFrame(main, text="Game Controls", padding="5")
         controls.grid(row=1, column=1, sticky="nsew", padx=5)
@@ -440,7 +431,12 @@ class GUI:
         control_buttons = ttk.Frame(controls)
         control_buttons.grid(row=0, column=0, columnspan=2, pady=5)
         ttk.Button(control_buttons, text="Start Game",
-                   command=lambda: self.send_all("start")).pack(side=tk.LEFT, padx=5)
+                   command=lambda: start).pack(side=tk.LEFT, padx=5)
+        
+        def start():
+            self.send_all("start")
+            self.state.started = True
+            self.state.accepting_players = False
 
         # Round counter
         round_frame = ttk.Frame(controls)
@@ -464,7 +460,7 @@ class GUI:
         ttk.Button(spinner_frame, text="Spin",
                    command=self.spin_wheel).pack(side=tk.LEFT, padx=5)
         ttk.Button(spinner_frame, text="Lights Off",
-                   command=lambda: self.send_command("light_wheel:off")).pack(side=tk.LEFT, padx=5)
+                   command=lambda: self.server.send(0, json.dumps({"type": "light_wheel", "data": "off"}))).pack(side=tk.LEFT, padx=5)
 
         # Enhanced virtual spinner
         spinner_frame = ttk.LabelFrame(controls, text="Virtual Spinner")
@@ -497,34 +493,8 @@ class GUI:
         self.health_val = tk.StringVar()
         ttk.Entry(health_frame, textvariable=self.health_val, width=5).pack(side=tk.LEFT, padx=5)
 
-        def update_client():
-            try:
-                client_id = int(self.client_id.get())
-                health = int(self.health_val.get())
-                
-                if client_id not in self.state.clients:
-                    messagebox.showerror("Error", f"Client {client_id} not found")
-                    return
-                    
-                if health <= 0:
-                    messagebox.showerror("Error", "Health must be positive")
-                    return
-
-                # Update player health
-                for player in self.state.players:
-                    if player.id == client_id:
-                        player.health = health
-                        break
-
-                cmd = f"health:{health}"
-                print(f"Sending command: {cmd}")
-                self.state.clients[client_id].send_(cmd)
-
-            except ValueError:
-                messagebox.showerror("Error", "Invalid input")
-
         ttk.Button(client_controls, text="Update Client", 
-            command=update_client).grid(row=0, column=2, padx=5)
+            command=self.update_client).grid(row=0, column=2, padx=5)
 
 
         # Command Section
@@ -542,9 +512,7 @@ class GUI:
         # Send buttons with fixed one-liner command
             # Then modify the button command:
         ttk.Button(cmd_frame, text="Send",
-                command=lambda: self.send_to_client(
-                    self.client_entry.get(),
-                    self.cmd_entry.get())
+                command=lambda: self.handle_command_send()
         ).grid(row=0, column=4, padx=5)
         
         ttk.Button(cmd_frame, text="Send All", 
@@ -554,6 +522,44 @@ class GUI:
         ttk.Button(main, text="S", width=3,
                    command=self.switch_to_simple).grid(row=0, column=1,
                                                        sticky="ne", padx=5, pady=5)
+        
+    def update_client(self):
+        try:
+            client_id = int(self.client_id.get())
+            health = int(self.health_val.get())
+            
+            if health <= 0:
+                messagebox.showerror("Error", "Health must be positive")
+                return
+
+            # Find and update player
+            player = next((p for p in self.state.players if p.id == cli+30
+                           .as_integer_ratio), None)
+            if player:
+                player.health = health
+                self.server.send(client_id, json.dumps({
+                    "type": "health",
+                    "health": health
+                }))
+                self.update_client_list()
+            else:
+                messagebox.showerror("Error", f"Client {client_id} not found")
+
+        except ValueError:
+            messagebox.showerror("Error", "Invalid input")
+        
+    def handle_command_send(self, id=None, command=None):
+        client_id = self.client_entry.get() if id is None else id
+        command = self.cmd_entry.get() if id is None else command
+        
+        # Parse command and data
+        cmd_parts = command.split(':')
+        payload = {
+            "type": cmd_parts[0],
+            "data": cmd_parts[1] if len(cmd_parts) > 1 else None
+        }
+        
+        self.server.send(client_id, json.dumps(payload))
 
     def draw_virtual_spinner(self, canvas):
         center_x, center_y = 137, 137
@@ -660,33 +666,11 @@ class GUI:
             else:
                 self.console_status.configure(text="Disconnected", foreground="red")
 
-    def send_to_client(self, client_id, message):
-        try:
-            client_id = int(client_id)
-            if client_id in self.state.clients:
-                self.state.clients[client_id].send(message.encode())
-                print(f"Sent to client {client_id}: {message}")
-                return True
-            else:
-                print(f"Client {client_id} not found")
-                return False
-        except Exception as e:
-            print(f"Error sending to client {client_id}: {e}")
-            return False
+    def send(self, client_id, message):
+        self.handle_command_send(client_id, message)
 
     def send_all(self):
-        retries = 2
-        print(self.cmd_entry.get())
-        while retries > 0:
-            try:
-                for client in self.state.clients:
-                    print(f"Sending to client {client}: {self.cmd_entry.get()}")
-                    self.state.clients[client].send(self.cmd_entry.get().encode())
-                else:
-                    break
-            except RuntimeError as e:
-                retries -= 1
-                print(f"Error sending to all clients (retries left: {retries}): {e}")
+        self.server.broadcast(json.dumps({"type": f"{self.cmd_entry.get()}"}))
 
     def spin_wheel(self):
         try:
@@ -694,66 +678,52 @@ class GUI:
                 wheel_id = [int(x) for x in self.wheel_id.get().split(",")]
                 id1, id2 = wheel_id
                 self.animate_wheel([id1 - 1, id2 - 1], double_choice=True)
-                self.send_to_client(0, f"light_wheel:[{id1 - 1},{id2 - 1}]")
+                self.send(0, f"light_wheel:[{id1 - 1},{id2 - 1}]")
             else:
                 wheel_id = int(self.wheel_id.get())
                 self.animate_wheel(wheel_id - 1)
-                self.send_to_client(0, f"light_wheel:{wheel_id}")
+                self.send(0, f"light_wheel:{wheel_id}")
         except ValueError:
             print("Invalid wheel ID")
 
     def update_client_list(self):
-        # Clear existing items
-        if self.client_list is not None:
-            for item in self.client_list.get_children():
-                self.client_list.delete(item)
 
-            # Add all clients except console (ID 0)
-            tries = 3
-            while tries > 0:
-                try:
-                    for client_id in self.state.clients:
-                        if client_id != 0:  # Skip console
-                            # Find player object for this client
-                            player = next((p for p in self.state.players if p.id == client_id), None)
+        if self.client_list is None:
+            return
+            
+        for item in self.client_list.get_children():
+            self.client_list.delete(item)
 
-                            if player:
-                                role = "Default"
-                                if player.state == PlayerState.PICKER:
-                                    role = "Picker"
-                                elif player.state == PlayerState.GUESSER:
-                                    role = "Guesser"
-                                elif player.state == PlayerState.BETTER:
-                                    role = "Better"
-                                elif player.state == PlayerState.DEAD:
-                                    role = "Dead"
+        for client_id in self.state.clients:
+            if client_id != 0:  # Skip console
+                player = next((p for p in self.state.players if p.id == client_id), None)
+                if not player:
+                    continue
+                    
+                role = "Default"
+                if player.state == PlayerState.PICKER:
+                    role = "Picker"
+                elif player.state == PlayerState.GUESSER:
+                    role = "Guesser"
+                elif player.state == PlayerState.BETTER:
+                    role = "Better"
+                elif player.state == PlayerState.DEAD:
+                    role = "Dead"
 
-                                # Insert client info
-                                self.client_list.insert("", "end", values=(
-                                    client_id,
-                                    role,
-                                    player.health if hasattr(player, 'health') else 100,
-                                    player.guess if hasattr(player, 'guess') else ""
-                                ))
-                            else:
-                                # New client without player object
-                                self.client_list.insert("", "end", values=(
-                                    client_id,
-                                    "Default",
-                                    100,
-                                    ""
-                                ))
-                    else:
-                        break
-                except RuntimeError:
-                    tries -= 1
-                    print("Error updating client list, retrying...")
-                    time.sleep(0.5)
+                self.client_list.insert("", "end", values=(
+                    client_id,
+                    role,
+                    player.health,
+                    ""  # Pick column always empty in server view
+                ))
 
     def update_gui(self):
         self.players_var.set(f"Players: {len(self.state.clients) - (1 if self.state.console_connected else 0)}")
         self.update_console_status()
         self.update_client_list()
+        self.state.max_rounds = int(self.round_count.get())
+        if not self.state.started:
+            self.send(0, f"clients:[{self.state.clients.keys()}]")
 
 
 class GameState:
@@ -778,472 +748,537 @@ class Player:
     def __init__(self, identifier: int):
         self.id = identifier
         self.state = PlayerState.DEFAULT
-        self.bet = 0
-        self.guess = 0
-        self.health = 100
+        self.health = 100 if not LIMITED else 15
 
 
 class GameServer:
-    def __init__(self, gamestate, gui):
+    def __init__(self, game, gamestate, bind_address="192.168.137.1"):
+        print("Starting Game Server...")
         self.state = gamestate
-        self.gui = gui
+        self.game = game
+        
+        self.start_broker()
 
-        # Start TCP server for game clients
-        self.game_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.game_sock.bind(('0.0.0.0', 8080))
-        self.game_sock.listen(10)
+        self.client = mqtt.Client()
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
 
-        self.log = []
-        self.current_log = []
-        self.old_log = []
+        self.wheel_response_received = threading.Event()
+        self.wheel_done = False
 
-        # Configure HTTP handler with state access
-        #class ConfiguredHandler(WebInterfaceHandler):
-        #game_state = self.state
+        self.picker_response = threading.Event()
+        self.picker_number = None
+        self.guesser_responses = [threading.Event(), threading.Event()]
+        self.guesser_numbers = [None, None]
+        self.better_responses = {} 
 
-        #self.http_server = HTTPServer(('0.0.0.0', 8000), ConfiguredHandler)
+        max_retries = 5
+        retry_delay = 0.5
 
-        print("Game server running on port 8080")
-        #print("Web interface on http://localhost:8000")
+        self.last_pings = {}
 
-        threading.Thread(target=self.accept_clients).start()
-        #threading.Thread(target=self.http_server.serve_forever).start()
-
-    def accept_clients(self):
-        while True:
-            client, addr = self.game_sock.accept()
-            threading.Thread(target=self.handle_client, args=(client, addr)).start()
-
-    def handle_client(self, client, addr):
-        client_id = None
-        try:
-            client.settimeout(30)
-
-            print(f"New connection from {addr}")
-            data = client.recv(1024).decode()
-            if data.startswith('id:'):
-                client_id = int(data.split(':')[1])
-                handler = ClientHandler(client, client_id)
-                self.state.clients[client_id] = handler
-
-                if str(client_id) == str(0):
-                    self.state.console_connected = True
-                    print("Console connected")
-                    
+        self.cleanup_running = True
+        self.cleanup_thread = threading.Thread(target=self.cleanup_loop)
+        self.cleanup_thread.daemon = True
+        self.cleanup_thread.start()
+        
+        for attempt in range(max_retries):
+            try:
+                self.client.connect(bind_address, 1883, 60)
+                self.client.loop_start()
+                print(f"MQTT connected on attempt {attempt + 1}")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"Connection attempt {attempt + 1} failed, retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
                 else:
-                    print(f"Client {client_id} connected from {addr}")
+                    print(f"Failed to start MQTT client after {max_retries} attempts: {e}")
+                    sys.exit(1)
 
-                client.send(b"ok")
-
-                while True:
-                    try:
-                        # Set a short timeout for recv
-                        client.settimeout(0.1)
-                        data = client.recv(1024).decode()
-                        
-                        if not data:
-                            raise ConnectionResetError("No data")
-
-                        print(f"DEBUG: Received raw data from client {client_id}: {data}") if ("heartbeat" not in data) and ("ok" not in data) else None
-
-                        # Handle different message types
-                        if "heartbeat" in data:
-                            handler.send(b"ok")
-                        else:
-                            self.old_log.append(data)
-                            self.log = self.old_log
-                            self.current_log = self.log
-                            
-                            if client_id == 0:
-                                if data.startswith("start"):
-                                    print(f"Received start from console: {data}")
-                                    self.state.started = True
-                                elif "ok" not in data:
-                                    print(f"Received from client {client_id}: {data}")
-
-                            # Handle game commands
-                            if data.startswith(("pick:", "guess+", "bet+")):
-                                print(f"Received command from client {client_id}: {data}")
-                            elif "ok" not in data:
-                                print(f"Received from client {client_id}: {data}")
-
-                            handler.send(b"ok")
-
-                    except socket.timeout:
-                        if time.time() - handler.last_successful_comm > 15.0:
-                            raise ConnectionResetError("Client dead")
-                        continue
-                    except ConnectionResetError:
-                        if client_id in self.state.clients:
-                            del self.state.clients[client_id]
-                            self.state.players = [p for p in self.state.players if p.id != client_id]
-                            self.gui.update_gui()
-                    except Exception as e:
-                        print(f"Error handling client {client_id}: {e}")
-                        if client_id in self.state.clients:
-                            del self.state.clients[client_id]
-                            # Remove associated player
-                            self.state.players = [p for p in self.state.players if p.id != client_id]
-                            # Update GUI
-                            self.gui.update_gui()
-                        break
-
-        except Exception as e:
-            print(f"Client {client_id} error: {e}")
-        finally:
-            if client_id in self.state.clients:
-                try:
-                    print(f"Removing client {client_id}")
-                    del self.state.clients[client_id]
-                except Exception as e:
-                    print(f"Error removing client {client_id}: {e}")
-
-            client.close()
-
-    def send(self, id, message):
+    def start_broker(self):
         try:
-            if id in self.state.clients:
-                self.state.clients[id].send(message.encode())
-                return True
-            else:
-                print(f"Client {id} not found")
-                return False
+            print("Starting Mosquitto MQTT broker...")
+            # Check if port is in use
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            in_use = sock.connect_ex(('192.168.137.1', 1883)) == 0
+            sock.close()
+            
+            if in_use:
+                print("Port 1883 is in use, killing existing broker...")
+                # Kill any existing mosquitto process
+                subprocess.run(["taskkill", "/f", "/im", "mosquitto.exe"], 
+                            capture_output=True)
+                # Force close port on Windows
+                subprocess.run(["netsh", "int", "ipv4", "delete", "excludedportrange", 
+                            "protocol=tcp", "startport=1883", "numberofports=1"],
+                            capture_output=True)
+                time.sleep(3)  # Wait for cleanup
+                
+            # Create config file    
+            config_content = """
+    listener 1883
+    allow_anonymous true
+    persistence false
+    bind_address 192.168.137.1
+            """
+            config_path = "mosquitto.conf"
+            with open(config_path, "w") as f:
+                f.write(config_content)
+            
+            # Start broker in new window
+            broker_cmd = f'''
+            Start-Process powershell -ArgumentList "-NoExit", "-Command", `
+            "& 'C:\\Program Files\\mosquitto\\mosquitto.exe' -c {os.path.abspath(config_path)} -v"
+            '''
+            
+            subprocess.run(["powershell", "-Command", broker_cmd])
+            time.sleep(2)  # Wait for startup
+            print("Mosquitto MQTT broker started")
+            
         except Exception as e:
-            print(f"Error sending to client {id}: {e}")
-            return False
+            print(f"Error starting broker: {e}")
+            raise
 
-    def close(self):
-        self.game_sock.close()
-        self.http_server.shutdown()
+    def on_connect(self, client, userdata, flags, rc):
+            print("Connected to MQTT broker")
+            # Core channels
+            self.client.subscribe("game/server")
+            self.client.subscribe("game/health")
+            self.client.subscribe("game/wheel/response")
+            self.client.subscribe("game/console")
+            # Game channels
+            self.client.subscribe("game/picker/response")
+            self.client.subscribe("game/guesser/response")
+            self.client.subscribe("game/better/response")
+            self.client.subscribe("game/roles/#")  # All role assignments
+            self.client.subscribe("game/client/#")  # All client messages
+            print("Subscribed to all game channels")
+        
+    def on_message(self, client, userdata, msg):
+        try:
+            # Decode payload
+            if isinstance(msg.payload, bytes):
+                decoded = msg.payload.decode()
+            else:
+                decoded = msg.payload
+                
+            # Parse JSON - handle both string and dict formats
+            if isinstance(decoded, str):
+                try:
+                    payload = json.loads(decoded)
+                except:
+                    payload = decoded
+            else:
+                payload = decoded
+                
+            topic = msg.topic
+            
+            # Extract message components
+            if isinstance(payload, dict):
+                msg_type = payload.get('type')
+                data = payload.get('data')
+                client_id = payload.get('id')
+            else:
+                print(f"Unexpected payload format: {payload}")
+                return
 
-    def get_data(self):
-        log = self.current_log
-        return log
+            if msg_type == "connect":
+                print(f"Client {client_id} connected")
+                self.state.clients[client_id] = True
+                if client_id == 0:
+                    self.state.console_connected = True
+                self.game.gui.update_gui()
+            elif msg_type == "disconnect":
+                print(f"Client {client_id} disconnected")
+                # Remove from clients dictionary
+                if client_id in self.state.clients:
+                    self.state.clients.pop(client_id)
+                # Remove from players list
+                if hasattr(self.game, 'players'):
+                    self.game.players = [p for p in self.game.players if p.id != client_id]
+                    self.state.players = self.game.players
+                # Update console status
+                if client_id == 0:
+                    self.state.console_connected = False
+                # Update GUI
+                self.game.gui.update_gui()
 
-    def clear_data(self):
-        self.current_log = []
-        self.old_log = []
+            if topic == "game/wheel/response":
+                if msg_type == "light_wheel" and data == "done":
+                    self.wheel_done = True
+                    self.wheel_response_received.set()
+                    
+            elif topic == "game/picker/response":
+                if msg_type == "pick" and self.wait_for_picker:
+                    self.picker_number = int(data)
+                    self.picker_response.set()
+                    
+            elif topic == "game/guesser/response":
+                index = payload.get('index')
+                if msg_type == "guess" and 0 <= int(data) <= 100:
+                    self.guesser_numbers[index-1] = int(data)
+                    self.guesser_responses[index-1].set()
+                    
+            elif topic == "game/better/response":
+                if msg_type == "bet" and client_id in self.better_responses:
+                    event, _ = self.better_responses[client_id]
+                    self.better_responses[client_id] = (event, int(data))
+                    event.set()
+            elif topic == "game/console":
+                if msg_type == "start":
+                    self.state.started = True
+                    self.state.accepting_players = False
+
+            if msg_type == "ping":
+                self.last_pings[client_id] = time.monotonic()
+                    
+        except Exception as e:
+            print(f"Message handling error: {e}")
+
+    def cleanup_loop(self):
+        while self.cleanup_running:
+            current_time = time.monotonic()
+            # Check for clients that haven't pinged in 15 seconds
+            for client_id in list(self.state.clients.keys()):
+                if client_id == 0:  # Skip console
+                    continue
+                if current_time - self.last_pings.get(client_id, 0) > 15:
+                    print(f"Client {client_id} timed out")
+                    if client_id in self.state.clients:
+                        self.state.clients.pop(client_id)
+                    if hasattr(self.game, 'players'):
+                        self.game.players = [p for p in self.game.players if p.id != client_id]
+                        self.state.players = self.game.players
+                    self.game.gui.update_gui()
+            time.sleep(4)
+
+    def __del__(self):
+        self.cleanup_running = False
+
+    def handle_game_command(self, client_id, command, data):
+        try:
+            if command == "pick":
+                self.picker_number = int(data)
+                self.picker_response.set()
+            elif command == "guess":
+                index = int(data.split('+')[0])  # Get index from guess+index format
+                number = int(data.split(':')[1])
+                self.guesser_numbers[index-1] = number
+                self.guesser_responses[index-1].set()
+            elif command == "bet":
+                if client_id in self.better_responses:
+                    event, _ = self.better_responses[client_id]
+                    self.better_responses[client_id] = (event, int(data))
+                    event.set()
+        except Exception as e:
+            print(f"Game command error: {e}")
+
+    def wait_for_wheel_done(self, timeout=5):
+        self.wheel_response_received.clear()
+        self.wheel_done = False
+        if self.wheel_response_received.wait(timeout):
+            return self.wheel_done
+        return False
+    
+    def wait_for_picker(self, timeout=300):
+        return self.picker_response.wait(timeout)
+        
+    def wait_for_guessers(self, timeout=300):
+        return all(event.wait(timeout) for event in self.guesser_responses)
+        
+    def wait_for_betters(self, timeout=300):
+        return all(event.wait(timeout) for event, _ in self.better_responses.values())
+            
+
+    # filepath: /d:/projects/pycharm/GuessRoulette/game/server/main.py
+    # ...existing code...
+    def send(self, client_id, message):
+        try:
+            msg_json = json.loads(message)
+            payload = {
+                "type": msg_json.get("type", "unknown"),
+                "data": msg_json.get("data", None),  # Fallback if 'data' missing
+            }
+            # If there's a "health" field, include it
+            if "health" in msg_json:
+                payload["health"] = msg_json["health"]
+
+            topic = f"game/client/{client_id}"
+            self.client.publish(topic, json.dumps(payload), qos=1)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing message: {e}")
+    # ...existing code...
+
+    def broadcast(self, message):
+        msg_parts = message.split(':').strip("{}").strip('"').split(',')
+        payload = {
+            "type": msg_parts[1],
+            "data": msg_parts[4] if len(msg_parts) > 2 else None
+        }
+        topic = "game/broadcast"
+        self.client.publish(topic, json.dumps(payload), qos=1)
+
+    def handle_game_command(self, client_id, command, data):
+        if command == "pick":
+            self.handle_pick(client_id, data)
+        elif command == "guess":
+            self.handle_guess(client_id, data)
+        elif command == "bet":
+            self.handle_bet(client_id, data)
+
+    def assign_role(self, client_id, role, index=None):
+        payload = {
+            "type": "role",
+            "role": role,
+            "index": index
+        }
+        self.client.publish(f"game/roles/{client_id}", 
+                               json.dumps(payload), qos=1)
+                               
 
 
 class Game:
     def __init__(self):
+        # Core components
         self.state = GameState()
-
         self.wifi = WiFiHotspot()
-
         setup_wifi_peers_registry()
-
         self.wifi.start_hotspot()
+        self.server = GameServer(self, self.state)
+        self.gui = GUI(self.state, self.wifi, self.server)
 
-        self.gui = GUI(self.state, self.wifi)
-
-        self.server = GameServer(self.state, self.gui)
-
-        self.guesser_1_num = None
-        self.guesser_2_num = None
-        self.picker_id = None
-        self.picker_num = None
-        self.waiting_for_guessers = [False, False]
-        self.waiting_for_betters = [False * len(self.state.clients) - 3]
-        self.waiting_for_picker = False
-        self.players = []
-        self.betters = []
-        self.players_c = []
+        # Game state
         self.round = 0
         self.max_rounds = self.state.max_rounds
-
-        self.num_players = len(self.state.clients)
-
         self.running = True
-
-        self.state.players = self.players
-
+        
+        # Player tracking
+        self.players = []
+        self.players_c = []  # Current round players
+        self.picker = None
+        self.guessers = []
+        self.betters = []
+        
+        # Round state
+        self.picker_num = None
+        self.guesser_nums = [None, None]
+        self.waiting_states = {
+            'picker': False,
+            'guessers': [False, False],
+            'betters': []
+        }
+        
+        # Start game threads
         threading.Thread(target=self.run).start()
         self.gui.root.mainloop()
 
     def run(self):
-        cur_time = time.monotonic()
+        update_timer = time.monotonic()
         while self.running:
-            if time.monotonic() - cur_time > 1:
+            # Update GUI every second
+            if time.monotonic() - update_timer > 1:
                 self.gui.update_gui()
-                cur_time = time.monotonic()
-            if self.num_players != len(self.state.clients):
-                self.num_players = len(self.state.clients)
-                self.state.players = self.players
-                print(f"Players: {self.num_players}")
+                update_timer = time.monotonic()
 
-            if self.state.started:
-                self.state.accepting_players = False
-                print("Game started")
-                if self.num_players < 3:
-                    print("Not enough players to start game")
-                    self.state.started = False
-                    self.state.accepting_players = True
-                    time.sleep(1)
-                    continue
+            # Handle player count changes
+            if len(self.state.clients) != len(self.players):
+                self.update_players()
+
+            # Main game loop
+            if self.state.started and not self.state.accepting_players:
+                if len(self.players) < 3:
+                    self.handle_not_enough_players()
                 else:
-                    for client in self.state.clients.keys():
-                        self.players.append(Player(client))
-                    for player in self.players:
-                        self.server.send(player.id, "start")
-
-            if not self.state.accepting_players:
-                self.game()
+                    self.game_loop()
 
             time.sleep(0.01)
 
-    def game(self):
-        # send dead role to dead players
-        for player in self.players:
-            if player.state == PlayerState.DEAD:
-                self.server.send(player.id, f"role:{PlayerState.DEAD}")
-        # If there are less than 3 players living, end the game
-        if len([player for player in self.players if player.state != PlayerState.DEAD]) < 3:
-            winners = [player for player in self.players if player.state != PlayerState.DEAD]
-            if len(winners) == 2:
-                winner = max(winners, key=lambda player: player.health)
-                self.server.send(winner.id, "win")
-                print(f"Player {winner.id} wins")
-            elif len(winners) == 1:
-                self.server.send(winners[0].id, "win")
-                print(f"Player {winners[0].id} wins")
-            else:
-                pass
+    def handle_not_enough_players(self):
+        print("Not enough players to start game")
+        self.state.started = False
+        self.state.accepting_players = True
 
-            time.sleep(15)
+    def game_loop(self):
+        print(f"Starting round {self.round}")
+        # Check win conditions
+        if self.check_win_conditions():
+            return
 
-        if self.round < self.max_rounds:
-            self.reset_game()
-        else:
-            winner = max(self.players, key=lambda player: player.health)
-            self.server.send(winner.id, "win")
-            time.sleep(15)
-            for client_id in self.server.clients.keys():
-                self.server.send(client_id, "off")
-            self.server.close()
-            self.running = False
-            exit(0)
+        # Start new round if no waiting states
+        if not any(self.waiting_states.values()):
+            self.start_new_round()
+            return
 
-        if not self.waiting_for_picker and not any(self.waiting_for_guessers) and not any(self.waiting_for_betters):
-            self.players_c = [player for player in self.players if player.state != PlayerState.DEAD]
-            picker = self.choose_picker_and_betters()
-            if picker:
-                self.round += 1
+        # Handle picker phase
+        if self.waiting_states['picker']:
+            if self.server.wait_for_picker(timeout=300):
+                self.handle_picker_response()
 
-                self.server.send(0, f"light_wheel:{picker.id}")
-                # wait for id 0 to send back light_wheel:done
-                start_time = time.monotonic()
-                while True:
-                    if time.monotonic() - start_time > 5:  # 5 second timeout
-                        print("Timeout waiting for light_wheel:done")
-                        break
+        # Handle guessers and betters phase
+        if any(self.waiting_states['guessers']) or any(self.waiting_states['betters']):
+            if self.server.wait_for_guessers(timeout=300) and self.server.wait_for_betters(timeout=300):
+                self.finalize_round()
 
-                    if 0 not in self.server.state.clients:
-                        print("Client 0 not connected")
-                        break
+    def start_new_round(self):
+        self.round += 1
+        self.players_c = [p for p in self.players if p.state != PlayerState.DEAD]
+        
+        # Select roles
+        if self.select_roles():
+            # Light wheel for picker
+            self.server.send(0, json.dumps({
+                "type": "light_wheel", 
+                "data": self.picker.id
+            }))
+            
+            if self.server.wait_for_wheel_done():
+                # Assign roles
+                self.assign_roles()
+                self.waiting_states['picker'] = True
+                self.waiting_states['guessers'] = [False, False]
+                self.waiting_states['betters'] = [False] * len(self.betters)
 
-                    try:
-                        data = self.server.state.clients[0].recv(1024).decode()
-                        if data == "light_wheel:done":
-                            print("Light wheel animation completed")
-                            break
-                        else:
-                            print(f"Received unexpected data from client 0: {data}")
-                    except Exception as e:
-                        print(f"Error receiving data: {e}")
-                        break
-
-                    time.sleep(0.1)
-
-                self.server.send(picker.id, f"role:{PlayerState.PICKER}")
-                self.waiting_for_picker = True
-                self.picker_id = picker.id
-
-                for better in self.betters:
-                    self.server.send(better.id, f"role:{PlayerState.BETTER}+{self.betters.index(better) + 1}")
-        else:
-            print("I have no idea how this happened")
-
-        if self.waiting_for_picker:
-            data_log = self.server.get_data()
-            for client_id, data in data_log:
-                if client_id == self.picker_id and data.startswith("pick:"):
-                    try:
-                        number = int(data.split(":")[1])
-                        if 0 <= number <= 100:
-                            self.picker_num = number
-                            self.waiting_for_picker = False
-                            print(f"Picker chose number: {self.picker_num}")
-                            self.server.send(0, "light_wheel:off")
-
-                            guesser_1, guesser_2 = self.choose_guessers()
-                            if guesser_1 and guesser_2:
-                                self.server.send(0, f"light_wheel:[{guesser_1.id}, {guesser_2.id}]")
-                                self.server.send(guesser_1.id, f"role:{PlayerState.GUESSER}+1")
-                                self.server.send(guesser_2.id, f"role:{PlayerState.GUESSER}+2")
-                                self.waiting_for_guessers = [True, True]
-                                self.guesser_ids = [guesser_1.id, guesser_2.id]
-                                for better in self.betters:
-                                    self.waiting_for_betters[self.betters.index(better)] = True
-                        else:
-                            print("Number out of range")
-                    except ValueError:
-                        print("Invalid number format")
-
-        if any(self.waiting_for_guessers) or any(self.waiting_for_betters):
-            data_log = self.server.get_data()
-            for client_id, data in data_log:
-                if client_id in self.guesser_ids and (data.startswith("guess+1:") or data.startswith("guess+2:")):
-                    try:
-                        number = int(data.split(":")[1])
-                        if 0 <= number <= 100:
-                            if data.startswith("guess+1:"):
-                                self.guesser_1_num = number
-                                self.waiting_for_guessers[0] = False
-                            elif data.startswith("guess+2:"):
-                                self.guesser_2_num = number
-                                self.waiting_for_guessers[1] = False
-                            print(f"Guesser {client_id} chose number: {number}")
-
-                            if not any(self.waiting_for_guessers) and not any(self.waiting_for_betters):
-                                self.server.send(0, "light_wheel:off")
-                                self.calculate_diff()
-                                self.reset_game()
-                        else:
-                            print("Number out of range")
-                    except ValueError:
-                        print("Invalid number format")
-                elif client_id in [better.id for better in self.betters] and data.startswith("bet+"):
-                    try:
-                        number = int(data.split(":")[1])
-                        if 0 <= number <= 100:
-                            better = [better for better in self.betters if better.id == client_id][0]
-                            better.bet = number
-                            self.waiting_for_betters[self.betters.index(better)] = False
-                            print(f"Better {client_id} bet: {number}")
-
-                            if not any(self.waiting_for_guessers) and not any(self.waiting_for_betters):
-                                self.server.send(0, "light_wheel:off")
-                                self.calculate_diff()
-                                self.reset_game()
-                        else:
-                            print("Number out of range")
-                    except ValueError:
-                        print("Invalid number format")
-
-    def choose_picker_and_betters(self):
-        if len(self.players_c) >= 3:
-            picker = random.choice(self.players_c)
-            self.players_c.remove(picker)
-            picker.state = PlayerState.PICKER
-            print(f"Picker: {picker.id}")
-
-            self.betters = []
-            for player in self.players_c:
-                player.state = PlayerState.BETTER
-                self.betters.append(player)
-                print(f"Better: {player.id}")
-
-            return picker
-        else:
-            print("Not enough players to start the game")
-            return None
-
-    def choose_guessers(self):
-        if len(self.players_c) >= 2:
-            guesser_1 = random.choice(self.players_c)
-            self.players_c.remove(guesser_1)
-            guesser_1.state = PlayerState.GUESSER
-            print(f"Guesser 1: {guesser_1.id}")
-
-            guesser_2 = random.choice(self.players_c)
-            self.players_c.remove(guesser_2)
-            guesser_2.state = PlayerState.GUESSER
-            print(f"Guesser 2: {guesser_2.id}")
-
-            return guesser_1, guesser_2
-        else:
-            print("Not enough players to choose guessers")
-            return None, None
-
-    def calculate_diff(self):
-        picker_num = self.picker_num
-        guesser_1_num = self.guesser_1_num
-        guesser_2_num = self.guesser_2_num
-
-        diff_1 = abs(picker_num - guesser_1_num)
-        diff_2 = abs(picker_num - guesser_2_num)
-
+    def select_roles(self):
+        if len(self.players_c) < 3:
+            return False
+            
+        # Select picker
+        self.picker = random.choice(self.players_c)
+        self.players_c.remove(self.picker)
+        self.picker.state = PlayerState.PICKER
+        
+        # Select guessers
+        self.guessers = random.sample(self.players_c, 2)
+        for guesser in self.guessers:
+            self.players_c.remove(guesser)
+            guesser.state = PlayerState.GUESSER
+            
+        # Remaining players become betters
+        self.betters = self.players_c
         for better in self.betters:
-            if better.bet == 0:
-                print(f"Better {better.id} did not bet")
-            else:
-                if abs(better.bet - picker_num) <= 10:
-                    better.health += 10
-                elif abs(better.bet - picker_num) == 0:
-                    better.health += picker_num
-                elif abs(better.bet - picker_num) <= 70:
-                    better.health -= abs(better.bet - picker_num)
-                else:
-                    pass
+            better.state = PlayerState.BETTER
+            
+        return True
+    
+    def assign_roles(self):
+        # Assign picker
+        self.server.send(self.picker.id, json.dumps({
+            "type": "role",
+            "data": f"{PlayerState.PICKER}"
+        }))
+        
+        # Assign betters with index
+        for i, better in enumerate(self.betters):
+            self.server.send(better.id, json.dumps({
+                "type": "role",
+                "data": f"{PlayerState.BETTER}+{i+1}"
+            }))
 
-        if diff_1 > diff_2:
-            self.players[self.guesser_ids[0]].health -= diff_1
-        elif diff_2 > diff_1:
-            self.players[self.guesser_ids[1]].health -= diff_2
-        elif diff_2 == 0 and diff_1 == 0:
-            self.players[self.guesser_ids[0]].health = 100
-            self.players[self.guesser_ids[1]].health = 100
-        elif diff_2 == diff_1 and diff_1 != 0:
-            print("Both guessers are equally close to the picker's number")
+    def handle_picker_response(self):
+        self.picker_num = self.server.picker_number
+        self.waiting_states['picker'] = False
+        
+        # Turn off wheel and prepare for guessers
+        self.server.send(0, json.dumps({
+            "type": "light_wheel",
+            "data": "off"
+        }))
+        
+        # Light wheel for guessers
+        self.server.send(0, json.dumps({
+            "type": "light_wheel",
+            "data": [g.id for g in self.guessers]
+        }))
+        
+        if self.server.wait_for_wheel_done():
+            # Assign guesser roles
+            for i, guesser in enumerate(self.guessers):
+                self.server.send(guesser.id, json.dumps({
+                    "type": "role",
+                    "data": f"{PlayerState.GUESSER}+{i+1}"
+                }))
+            self.waiting_states['guessers'] = [True, True]
+            self.waiting_states['betters'] = [True] * len(self.betters)
+
+    def finalize_round(self):
+        self.server.send(0, json.dumps({
+            "type": "light_wheel",
+            "data": "off"
+        }))
+        
+        self.calculate_scores()
+        self.reset_round()
+
+    def calculate_scores(self):
+        # Calculate differences
+        guesser_diffs = [abs(self.picker_num - n) for n in self.guesser_nums]
+        
+        # Update guesser health
+        if all(diff == 0 for diff in guesser_diffs):
+            for guesser in self.guessers:
+                guesser.health = 100 if not LIMITED else 15
         else:
-            print("Error calculating differences")
-
-        # send updated health to players
+            for i, (guesser, diff) in enumerate(zip(self.guessers, guesser_diffs)):
+                if diff > guesser_diffs[1-i]:
+                    guesser.health -= diff
+                
+        # Update better health
+        for better in self.betters:
+            diff = abs(better.bet - self.picker_num)
+            if diff <= 10 if not LIMITED else 2:
+                better.health += 10 if not LIMITED else 2
+            elif diff == 0:
+                better.health += self.picker_num
+            elif diff <= 70 if not LIMITED else 10:
+                better.health -= diff
+                
+        # Send health updates and check for deaths
         for player in self.players:
-            self.server.send_to_client(player.id, f"health:{player.health}")
-
+            self.server.send(player.id, json.dumps({
+                "type": "health",
+                "health": player.health
+            }))
+            
             if player.health <= 0:
                 player.state = PlayerState.DEAD
+                self.server.send(player.id, json.dumps({
+                    "type": "role",
+                    "data": f"{PlayerState.DEAD}"
+                }))
 
-        print(f"Difference for Guesser 1: {diff_1}")
-        print(f"Difference for Guesser 2: {diff_2}")
+    def reset_round(self):
+        # Reset states
+        self.picker = None
+        self.guessers = []
+        self.betters = []
+        self.picker_num = None
+        self.guesser_nums = [None, None]
+        self.waiting_states = {
+            'picker': False,
+            'guessers': [False, False],
+            'betters': []
+        }
 
-    def reset_game(self):
-        # Reset player states
-        for player in self.players:
-            player.state = PlayerState.DEFAULT if player.state != PlayerState.DEAD else PlayerState.DEAD
-
-        # Clear old data
-        self.server.clear_data()
+    def check_win_conditions(self):
+        alive_players = [p for p in self.players if p.state != PlayerState.DEAD]
         
-        # Send clear command and record time
-        clear_time = time.time()
-        for player in self.players:
-            if player.id in self.state.clients:
-                self.server.send(player.id, "clear")
-
-        # Wait for new acknowledgments
-        responded_players = set()
-        while len(responded_players) < len([p for p in self.players if p.id in self.state.clients]):
-            data_log = self.server.get_data()
-            for client_id, data, timestamp in data_log:
-                if (timestamp > clear_time and 
-                    client_id in self.state.clients and 
-                    data.strip() == "ok"):
-                    responded_players.add(client_id)
-
-        # Reset game state
-        self.waiting_for_picker = False
-        self.waiting_for_guessers = [False, False]
-        self.waiting_for_betters = [False] * len(self.betters)
-        self.picker_id = None
-        self.picker_num = 0
-        self.guesser_1_num = None
-        self.guesser_2_num = None
-        self.guesser_ids = None
-
-        self.game()
+        if len(alive_players) < 3 or self.round >= self.max_rounds:
+            winner = max(alive_players, key=lambda p: p.health)
+            self.server.send(winner.id, json.dumps({"type": "win"}))
+            time.sleep(15)
+            
+            for player in self.players:
+                self.server.send(player.id, json.dumps({"type": "off"}))
+                
+            self.running = False
+            return True
+            
+        return False
+    
+    def update_players(self):
+        self.players = [Player(id) for id in self.state.clients.keys()]
+        self.state.players = self.players
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ import rotaryio
 import pwmio
 import adafruit_displayio_sh1106
 import displayio
+import json 
+import adafruit_minimqtt.adafruit_minimqtt as MQTT
+
 
 class Display:
     def __init__(self):
@@ -96,18 +99,20 @@ class Display:
         self.current_group = group
         self.display.root_group = group
 
-class WiFiClient:
-    def __init__(self, ssid, password, client_id):
-        self.ssid = ssid
-        self.password = password
+class MQTTGameClient:
+    def __init__(self, client_id):
         self.client_id = client_id
-        self.sock = None
+        self.mqtt_client = None
         self.connected = False
+        self.callback = None
+        self.ssid = "GuessRoulette"
+        self.password = "password123"
 
-        self._connect()
-
-    def _connect(self):
-        attempt = 0
+        self.last_ping = time.monotonic()
+        
+        self.connect()
+        
+    def connect(self):
         while True:
             try:
                 print("\nConnecting to WiFi...")
@@ -122,177 +127,101 @@ class WiFiClient:
 
                 print("Connected to WiFi!")
                 print("IP Address:", str(wifi.radio.ipv4_address))
-                time.sleep(5)  # WiFi stabilization
-
-                print("\nConnecting to server...")
+                time.sleep(5)  # WiFi stabilizationa
                 pool = socketpool.SocketPool(wifi.radio)
+                print("Connecting to MQTT broker...")
 
-                for attempt_num in range(3):
-                    try:
-                        print(f"Connection attempt {attempt_num + 1}...")
-                        self.sock = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+                # Setup MQTT client
+                self.mqtt_client = MQTT.MQTT(
+                    broker="192.168.137.1",
+                    port=1883,
+                    client_id=f"pico_{self.client_id}",
+                    socket_pool=pool,
+                    socket_timeout=0.5,    # Socket timeout shortest
+                    keep_alive=15,         # Keep alive longest
+                )
 
-                        # Ensure the socket is in blocking mode
-                        self.sock.setblocking(True)
+                self.mqtt_client.on_connect = self.on_connect
+                self.mqtt_client.on_disconnect = self.on_disconnect
+                self.mqtt_client.on_message = self.on_message
 
-                        print("Initiating connection...")
-                        connected = False
-                        # try to connect to 192.168.137.1, and if that doesnt work, go to 169.254.104.12
-                        self.sock.connect(("192.168.137.1", 8080))
-
-
-                        print("Sending ID...")
-                        id_msg = f"id:{self.client_id}".encode()
-                        self.sock.send(id_msg)
-
-                        print("Waiting for response...")
-                        self.sock.settimeout(5)
-
-                        buffer = bytearray(1024)
-                        bytes_read = self.sock.recv_into(buffer)
-                        if bytes_read:
-                            response = buffer[:bytes_read].decode()
-                            if response == "ok":
-                                print("Connected to server!")
-                                self.sock.settimeout(None)  # Remove timeout
-                                self.connected = True
-
-                                return
-                            else:
-                                print(f"Unexpected response: {response}")
-                        else:
-                            print("No response received")
-
-                        self.sock.close()
-                        self.sock = None
-                        time.sleep(2)
-
-                    except Exception as e:
-                        print(f"Attempt {attempt_num + 1} failed: {e}")
-                        if self.sock:
-                            try:
-                                self.sock.close()
-                            except:
-                                pass
-                            self.sock = None
-                        time.sleep(2)
-
-                raise RuntimeError("All connection attempts failed")
-
+                self.mqtt_client.connect()
+                print("Connected to MQTT broker")
+                return
             except Exception as e:
                 print(f"Connection failed: {e}")
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except:
-                        pass
-                self.sock = None
-                self.connected = False
 
-                attempt += 1
-                wait_time = min(attempt * 2, 10)
-                print(f"Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-        
-    def send(self, data):
-        """Send data to server and wait for 'ok' response."""
-        print(f"Sending to server: {data}")
+    async def ping_loop(self):
+        while True:
+            if self.connected:
+                self.publish("game/server", json.dumps({
+                    "type": "ping",
+                    "id": self.client_id
+                }))
+            await asyncio.sleep(5)  # Ping every 5 seconds
+
+    def on_connect(self, client, userdata, flags, rc):
+        print(f"Connected with result code {rc}")
+        if rc == 0:
+            self.connected = True
+            # Subscribe to topics
+            topics = [
+                f"game/client/{self.client_id}",
+                "game/broadcast"
+            ]
+            for topic in topics:
+                client.subscribe(topic)
+
+            connect_payload = {"type": "connect", "id": self.client_id}
+            self.publish("game/server", json.dumps(connect_payload))
+
+    def on_disconnect(self, client, userdata, rc):
+        print(f"Disconnected with result code {rc}")
+        self.connected = False
+        self.leds["led1"].value = True
+        # Try to reconnect
+        self.connect()
+            
+    def publish(self, topic, message):
+        if not self.connected:
+            self.connect()
         try:
-            if not self.connected:
-                self._connect()
-
-            # Ensure blocking mode for send/receive sequence
-            self.sock.setblocking(True)
-
-            # Send the data
-            self.sock.send(data.encode())
-
-            # Wait for acknowledgment
-            buffer = bytearray(1024)
-            bytes_read = self.sock.recv_into(buffer)
-            if bytes_read:
-                response = buffer[:bytes_read].decode()
-                if response.strip() == "ok":
-                    print("Server acknowledged")
-                    return True
-                else:
-                    print(f"Unexpected server response: {response}")
-                    return False
-            else:
-                print("No response from server")
-                return False
-
+            print(f"Publishing to {topic}: {message}")
+            self.mqtt_client.publish(topic, message, qos=1)
+            return True
         except Exception as e:
-            print(f"Send failed: {e}")
-            self.connected = False
-            self._connect()
+            print(f"Publish failed: {e}")
             return False
-
-    def receive_from_server(self):
-        """Receive data from server and send back 'ok'."""
+            
+    def on_message(self, client, topic, message):
+        print(f"Received message on {topic}: {message}")
         try:
-            if not self.connected:
-                self._connect()
-            self.sock.setblocking(False)
-
-            buffer = bytearray(1024)
-            bytes_read = self.sock.recv_into(buffer)
-            if bytes_read:
-                data = buffer[:bytes_read].decode()
-                print(f"Received from server: {data}")
-
-                # Send back 'ok'
-                self.sock.setblocking(True)
-                self.sock.send(b"ok")
-                self.sock.setblocking(False)
-
-                return data
-        except OSError:
-            pass  # No data received
+            if self.callback:
+                self.callback(topic, message)
         except Exception as e:
-            print(f"Receive failed: {e}")
-            self.connected = False
-            self._connect()
-        finally:
-            self.sock.setblocking(True)
-        return None
-
-    def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except:
-                pass
-        wifi.radio.stop_station()
+            print(f"Message handling error: {e}")
+            
+    def set_callback(self, callback):
+        self.callback = callback
+        
+    def check_messages(self):
+        self.mqtt_client.loop(1.0)
 
 class Console:
     def __init__(self):
         self.display = Display()
 
         self.lights = {
-            1: digitalio.DigitalInOut(board.GP0),
-            2: digitalio.DigitalInOut(board.GP1),
-            3: digitalio.DigitalInOut(board.GP2),
-            4: digitalio.DigitalInOut(board.GP3),
-            5: digitalio.DigitalInOut(board.GP5),
-            6: digitalio.DigitalInOut(board.GP4),
-            7: digitalio.DigitalInOut(board.GP6),
-            8: digitalio.DigitalInOut(board.GP7),
-            9: digitalio.DigitalInOut(board.GP8),
-            10: digitalio.DigitalInOut(board.GP9)
-        }
-
-        self.client_mapping = {
-            1: self.lights[1],
-            2: self.lights[2],
-            3: self.lights[3],
-            4: self.lights[4],
-            5: self.lights[5],
-            6: self.lights[6],
-            7: self.lights[7],
-            8: self.lights[8],
-            9: self.lights[9],
-            10: self.lights[10]
+            2: digitalio.DigitalInOut(board.GP0),
+            3: digitalio.DigitalInOut(board.GP1),
+            4: digitalio.DigitalInOut(board.GP2),
+            5: digitalio.DigitalInOut(board.GP3),
+            6: digitalio.DigitalInOut(board.GP5),
+            7: digitalio.DigitalInOut(board.GP4),
+            8: digitalio.DigitalInOut(board.GP6),
+            9: digitalio.DigitalInOut(board.GP7),
+            10: digitalio.DigitalInOut(board.GP8),
+            1: digitalio.DigitalInOut(board.GP9)
         }
 
         for light in self.lights.values():
@@ -365,7 +294,9 @@ class Console:
         await self.display.boot()
         
         # Initialize WiFi
-        self.client = WiFiClient("GuessRoulette", "password123", 0)
+        self.client = MQTTGameClient(0)
+
+        self.client.set_callback(self._on_mqtt_message)
         
         # Once connected, clear screen
         if self.client.connected:
@@ -376,79 +307,75 @@ class Console:
         for light in self.lights.values():
             light.value = False
 
+    def _on_mqtt_message(self, topic, message):
+        try:
+            # Parse incoming JSON
+            payload = json.loads(message)
+            # Pass payload to our game logic
+            self.process_server_data(payload)
+        except Exception as e:
+            print(f"JSON parse error: {e}")
 
     async def main(self):
         last_heartbeat = time.monotonic()
         while self.running:
             current_time = time.monotonic()
             if current_time - last_heartbeat >= 5.0:
-                try:
-                    if self.client.connected:
-                        self.client.sock.send(b"heartbeat")
-                        self.client.sock.settimeout(4)
-                        buffer = bytearray(1024)
-                        bytes_read = self.client.sock.recv_into(buffer)
-                        if bytes_read:
-                            response = buffer[:bytes_read].decode()
-                            if response.strip() == "ok":
-                                print("Heartbeat acknowledged")
-                                last_heartbeat = current_time
-                            else:
-                                raise Exception("Unexpected heartbeat response")
-                        else:
-                            raise Exception("No heartbeat response")
-                    else:
-                        raise Exception("Client not connected")
-                except Exception as e:
-                    print(f"Heartbeat failed: {e}")
-                    self.client.connected = False
-                    self.client._connect()
-                # recieve data, if data is recieved, process it
-                data = self.client.receive_from_server()
-                if data:
-                    print(f"Data received: {data}")
-                    if data.startswith("clients:"):
-                        self.clients = [int(x) for x in data.split(":")[1].strip("[]").split(",")]
-                        if "0" in self.clients:
-                            self.clients.remove("0")
-                        print(f"Clients: {self.clients}")
-                    elif data.startswith("light_wheel:"):
-                        if "[" in data:
-                            self.choices = [int(x) for x in data.split(":")[1].strip("[]").split(",")]
-                            self.light_wheel(self.choices, double_choice=True)
-                            self.client.send("light_wheel:done")
-                        elif "off" in data:
-                            self.turn_off_all_lights()
-                        else:
-                            choice = int(data.split(":")[1])
-                            self.light_wheel(choice, double_choice=False)
-                    elif data.startswith("display:"):
-                        pass
-                    elif data.startswith("win"):
-                        self.win()
-                    elif "ok" in data:
+                if not self.client.connected:
+                    self.client.connect()
+                last_heartbeat = current_time
+            # Check MQTT messages
+            self.client.check_messages()
+    
+
+            if not self.started:
+                for client in self.clients:
+                    if client == 0:
                         pass
                     else:
-                        print(f"Unknown data: {data}")
-
-
-                if not self.started:
-                    for client in self.clients:
-                        if int(client) in int(self.lights.keys()):
+                        if int(client) in self.lights.keys():
                             self.lights[client].value = True
-                else:
-                    self.turn_off_all_lights()
+                        else:
+                            self.lights[client].value = False
+            else:
+                self.turn_off_all_lights()
 
 
-                if self.start.value:
-                    self.turn_off_all_lights()
-                    self.started = True
-                    self.client.send("start")
+            if self.start.value:
+                self.turn_off_all_lights()
+                self.started = True
+                self.client.publish("game/console", json.dumps({"type": "start"}))
 
-                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1)
+            
+    def process_server_data(self, payload):
+        msg_type = payload.get('type')
+        data = payload.get('data')
+
+        if msg_type == "clients":
+            try:
+                # Clean up dict_keys format and extract numbers
+                cleaned = data.replace('dict_keys(', '').replace(')', '').replace('[', '').replace(']', '')
+                client_list = cleaned.replace(' ', '').split(',')
+                self.clients = [int(x) for x in client_list if x.isdigit()]
+            except Exception as e:
+                print(f"Error parsing clients: {e}")
+                self.clients = []
+        elif msg_type == "light_wheel":
+            if "off" in data:
+                self.turn_off_all_lights()
+            else:
+                self.light_wheel(int(data)) if not isinstance(data, list) else self.light_wheel(data, double_choice=True)
+            self.client.publish("game/wheel/response", 
+                json.dumps({"type": "light_wheel", "data": "done"}))
+        elif msg_type == "display":
+            pass
+        elif msg_type == "win":
+            pass
+        else:
+            pass
 
     def win(self):
-        asyncio.run(self.audio.play_tracks(self.audio.tracks()))
         times = 15
         for _ in range(times/2):
             for light in self.lights.values():
