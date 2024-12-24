@@ -14,6 +14,7 @@ using Microsoft.Win32;
 using System.Windows;
 using System.Text;
 
+// Define a constant Admin ID (Replace with a securely generated GUID)
 
 public enum PlayerRole
 {
@@ -37,7 +38,7 @@ public class Player
 
     public DateTime LastHeartbeat { get; set; } = DateTime.UtcNow;
 
-    public bool IsAdmin { get; set; } = false; // Added property
+    public bool IsAdmin { get; set; } = false; // Removed if not needed
 }
 
 // Holds game state
@@ -64,10 +65,30 @@ public class GameState
             if (Players.ContainsKey(playerId))
             {
                 var player = Players[playerId];
-                Players.Remove(playerId);
-                OnPlayerKicked?.Invoke(player);
-                Console.WriteLine($"Player kicked: {player.Name}");
+                if (this.GameStarted)
+                {
+                    player.Role = PlayerRole.DEAD;
+                }
+                else
+                {
+                    Players.Remove(playerId);
+                    OnPlayerKicked?.Invoke(player);
+                    Console.WriteLine($"Player kicked: {player.Name}");
+                }
             }
+        }
+    }
+
+    public void ResetGame()
+    {
+        lock (_lock)
+        {
+            Players.Clear();
+            GameStarted = false;
+            Round = 1;
+            SetupInProgress = false;
+            IsShuttingDown = false;
+            Console.WriteLine("Game has been reset.");
         }
     }
 }
@@ -100,7 +121,7 @@ public class RegistryHelper
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Failed to modify registry: {ex.Message}", 
+            MessageBox.Show($"Failed to modify registry: {ex.Message}",
                 "Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
@@ -128,7 +149,7 @@ public class RegistryHelper
 public static class AdminHelper
 {
     [DllImport("shell32.dll")]
-    private static extern int ShellExecuteW(IntPtr hwnd, string lpOperation, string lpFile, 
+    private static extern int ShellExecuteW(IntPtr hwnd, string lpOperation, string lpFile,
         string lpParameters, string lpDirectory, int nShowCmd);
 
     public static bool IsAdmin()
@@ -413,15 +434,24 @@ public class GameLogic
 
             _state.SetupInProgress = true;
 
-            // If we have fewer than 3 alive players, we can still proceed, but roles might be limited
+            // Fetch alive players (admins are no longer in Players list)
             var alivePlayers = _state.Players.Values
                 .Where(p => p.Role != PlayerRole.DEAD && p.Health > 0)
                 .ToList();
 
-            // If no alive players or only 1 or 2 left, handle potential end conditions
+            Console.WriteLine($"Proceeding game flow with {alivePlayers.Count} players.");
+
+            if (alivePlayers.Count < 3)
+            {
+                Console.WriteLine("Not enough players to continue the game.");
+                EndGame();
+                _state.SetupInProgress = false;
+                return;
+            }
+
+            // Handle potential end conditions
             if (alivePlayers.Count <= 1)
             {
-                // Single or zero survivors => immediate winner or no one
                 if (alivePlayers.Count == 1)
                 {
                     alivePlayers[0].Role = PlayerRole.WINNER;
@@ -433,7 +463,6 @@ public class GameLogic
             }
             if (alivePlayers.Count == 2)
             {
-                // Compare health
                 var ordered = alivePlayers.OrderByDescending(a => a.Health).ToList();
                 if (ordered[0].Health != ordered[1].Health)
                 {
@@ -443,7 +472,6 @@ public class GameLogic
                     _state.SetupInProgress = false;
                     return;
                 }
-                // If a tie, we can keep going or do a tie-break logic. For simplicity, we keep going.
             }
 
             // If we've exceeded max rounds, pick the top health
@@ -470,27 +498,26 @@ public class GameLogic
                 p.SubmittedNumber = -1;
             }
 
-            // 2) Assign 1 picker, 2 guessers if possible, rest betters
-            // Very naive approach
-            var shuffle = alivePlayers.OrderBy(_ => Guid.NewGuid()).ToList();
-            if (shuffle.Count > 0) shuffle[0].Role = PlayerRole.PICKER;
-            if (shuffle.Count > 1) shuffle[1].Role = PlayerRole.GUESSER;
-            if (shuffle.Count > 2) shuffle[2].Role = PlayerRole.GUESSER;
+            // 2) Assign roles randomly
+            AssignRolesRandomly(alivePlayers);
 
-            // The rest become betters
-            for (int i = 3; i < shuffle.Count; i++)
-            {
-                shuffle[i].Role = PlayerRole.BETTER;
-            }
-
-            // Now we wait for submissions from players. We'll move on only after:
-            // - The picker has submitted
-            // - All guessers and betters have submitted
-            // The actual waiting is triggered by the site interactions in this sample.
-            // We'll do a simple check in EvaluateSubmissions whenever players finish.
             Console.WriteLine($"Round {_state.Round} roles assigned.");
-
             _state.SetupInProgress = false;
+            _state.Round++;
+        }
+    }
+
+    private void AssignRolesRandomly(List<Player> alivePlayers)
+    {
+        var shuffled = alivePlayers.OrderBy(_ => Guid.NewGuid()).ToList();
+        if (shuffled.Count > 0) shuffled[0].Role = PlayerRole.PICKER;
+        if (shuffled.Count > 1) shuffled[1].Role = PlayerRole.GUESSER;
+        if (shuffled.Count > 2) shuffled[2].Role = PlayerRole.GUESSER;
+
+        // The rest become betters
+        for (int i = 3; i < shuffled.Count; i++)
+        {
+            shuffled[i].Role = PlayerRole.BETTER;
         }
     }
 
@@ -501,8 +528,7 @@ public class GameLogic
         {
             if (!_state.GameStarted) return;
 
-            // Are we in the "picker" stage? The next step is guessers + betters
-            // 1) Check if the PICKER is done
+            // Check if the PICKER is done
             var picker = _state.Players.Values
                 .FirstOrDefault(p => p.Role == PlayerRole.PICKER && p.Health > 0);
             if (picker != null && !picker.HasSubmitted)
@@ -510,25 +536,22 @@ public class GameLogic
                 // The game is waiting for the picker
                 return;
             }
-            // If the picker is assigned and has submitted, now guessers + betters
-            // Are guessers + betters done?
+
+            // Check if all guessers and betters have submitted
             var guessersOrBetters = _state.Players.Values
                 .Where(p => (p.Role == PlayerRole.GUESSER || p.Role == PlayerRole.BETTER) && p.Health > 0)
                 .ToList();
 
-            // If none exist, skip
             if (guessersOrBetters.Count > 0 && guessersOrBetters.Any(g => !g.HasSubmitted))
             {
                 // Some guessers/betters haven't submitted
                 return;
             }
 
-            // If we reach here, everyone who needed to submit has submitted
-            // 2) Calculate new health or apply game logic
+            // Everyone who needed to submit has submitted
             CalculateHealthAndReset();
 
-            // 3) Advance round or declare winner
-            _state.Round++;
+            // Advance round or declare winner
             ProceedGameFlow(); // this also checks if we exceeded max rounds
         }
     }
@@ -546,7 +569,7 @@ public class GameLogic
         foreach (var g in guessers)
         {
             int diff = Math.Abs(g.SubmittedNumber - selectedNumber);
-            g.Health -= diff; 
+            g.Health -= diff;
             if (g.Health <= 0)
             {
                 g.Health = 0;
@@ -569,8 +592,8 @@ public class GameLogic
             }
         }
 
-        // The "game reset" part: we do NOT restore any roles, we only keep them if they're dead or winner
-        // We'll handle official role resets in "ProceedGameFlow()" for the next round
+        // The "game reset" part: do NOT restore any roles, only keep them if they're dead or winner
+        // Official role resets are handled in "ProceedGameFlow()" for the next round
         Console.WriteLine("Round complete, updated health. Returning everyone to base page...");
     }
 
@@ -587,23 +610,23 @@ public class Program
     private static WiFiHotspot hotspot;
     private static bool cleanupDone = false;
 
+    public static readonly Guid AdminId = new Guid("11111111-1111-1111-1111-111111111111");
 
     private static void Cleanup(GameState gs)
     {
-        // set local gameState variable erual to gs
         var gameState = gs;
         if (cleanupDone) return;
         cleanupDone = true;
-        
+
         Console.WriteLine("Performing cleanup...");
         if (gameState != null)
         {
             gameState.IsShuttingDown = true; // Set shutdown flag
         }
-        Thread.Sleep(1000); // Wait for any pending requests to finish
+        Thread.Sleep(2000); // Wait for any pending requests to finish
         hotspot?.StopHotspot();
-        // sleep for 5 sec to allow for error messages to be viewed
-        Thread.Sleep(4000);
+        // sleep for 4 sec to allow for error messages to be viewed
+        Thread.Sleep(1000);
     }
 
     private static void SetupCleanupHandlers(GameState gs)
@@ -648,10 +671,8 @@ public class Program
             var gameState = new GameState();
             var gameLogic = new GameLogic(gameState);
 
-            // Initialize admin player
-            var adminPlayer = new Player { Name = "server", IsAdmin = true };
-            gameState.Players[adminPlayer.Id] = adminPlayer;
-            Console.WriteLine($"Admin registered: {adminPlayer.Name}, id={adminPlayer.Id}");
+            // Removed admin player initialization to exclude 'server' from Players list
+            // Console.WriteLine($"Admin registered: {adminPlayer.Name}, id={adminPlayer.Id}");
 
             SetupCleanupHandlers(gameState);
 
@@ -665,7 +686,7 @@ public class Program
             {
                 while (true)
                 {
-                    Thread.Sleep(3000); // Check every 30 seconds
+                    Thread.Sleep(30000); // Check every 30 seconds
                     var inactivePlayers = gameState.Players
                         .Where(p => !gameState.GameStarted && (DateTime.UtcNow - p.Value.LastHeartbeat).TotalSeconds > 60)
                         .Select(p => p.Key)
@@ -678,23 +699,29 @@ public class Program
                 }
             });
 
-            // 1) GET "/" => If no ?id=, show name form. Otherwise, show the player's main page
+            // 1) GET "/" => If no ?id=, show name form. Otherwise, show the player's main page or admin dashboard
             app.MapGet("/", (HttpRequest request, GameState gs) =>
             {
                 // get 'id' from query
                 var idStr = request.Query["id"].ToString();
                 if (string.IsNullOrWhiteSpace(idStr))
                 {
-                    // No ID => show name input page
+                    // No ID => show name input page with admin login button
                     return Results.Content(GenerateNameFormHtml(), "text/html");
                 }
                 else
                 {
-                    // Has ID => parse, find the player
-                    if (!Guid.TryParse(idStr, out Guid playerId)) 
+                    // Has ID => parse
+                    if (!Guid.TryParse(idStr, out Guid playerId))
                     {
                         // Invalid => show name form
                         return Results.Content(GenerateNameFormHtml("Invalid ID, please register again."), "text/html");
+                    }
+
+                    if (playerId == AdminId)
+                    {
+                        // Admin dashboard
+                        return Results.Content(GenerateAdminDashboardHtml(gs), "text/html");
                     }
 
                     if (!gs.Players.ContainsKey(playerId))
@@ -702,18 +729,9 @@ public class Program
                         return Results.Content(GenerateNameFormHtml("Unknown ID, please register again."), "text/html");
                     }
 
-                    // We have a known player => show the main game page
+                    // Regular player
                     var p = gs.Players[playerId];
-                    if (p.Name.ToLower() == "server")
-                    {
-                        // Admin dashboard
-                        return Results.Content(GenerateAdminDashboardHtml(gs), "text/html");
-                    }
-                    else
-                    {
-                        // Regular player page
-                        return Results.Content(GenerateGamePageHtml(p, gs), "text/html");
-                    }
+                    return Results.Content(GenerateGamePageHtml(p, gs), "text/html");
                 }
             });
 
@@ -758,12 +776,24 @@ public class Program
                 // Evaluate the game
                 logic.EvaluateSubmissions();
 
-                // Redirect back
-                return Results.Redirect($"/?id={playerId}");
+                // Redirect to intermediate screen
+                return Results.Redirect($"/intermediate?id={playerId}");
+            });
+
+            // Intermediate screen
+            app.MapGet("/intermediate", (HttpRequest request, GameState gs) =>
+            {
+                var idStr = request.Query["id"].ToString();
+                if (!Guid.TryParse(idStr, out Guid playerId) || !gs.Players.ContainsKey(playerId))
+                {
+                    return Results.Content("<h1>Invalid player ID</h1>", "text/html");
+                }
+
+                var player = gs.Players[playerId];
+                return Results.Content(GenerateIntermediatePageHtml(player), "text/html");
             });
 
             // 4) POST "/admin/startGame" => starts the game and sets initial roles
-            // Example for /admin/startGame
             app.MapPost("/admin/startGame", (HttpRequest request, GameState gs, GameLogic logic) =>
             {
                 if (!IsAdminRequest(request, gs))
@@ -776,13 +806,32 @@ public class Program
                     return Results.Json(new { message = "Game is already running." });
                 }
 
+                // Check for minimum number of players excluding the admin
+                int playerCount = gs.Players.Values.Count(p => p.Role != PlayerRole.DEAD && p.Health > 0);
+                if (playerCount < 3)
+                {
+                    return Results.Json(new { message = "At least 3 players are required to start the game." }, statusCode: 400);
+                }
+
                 logic.StartGame();
                 logic.ProceedGameFlow();
                 Console.WriteLine("Admin started the game.");
                 return Results.Json(new { message = "Game started." });
-});
+            });
 
-            // Similarly update other admin endpoints to return JSON instead of redirects
+            // 5) POST "/admin/resetGame" => resets the game
+            app.MapPost("/admin/resetGame", (HttpRequest request, GameState gs) =>
+            {
+                if (!IsAdminRequest(request, gs))
+                {
+                    return Results.Json(new { message = "Forbidden." }, statusCode: 403);
+                }
+
+                gs.ResetGame();
+                Console.WriteLine("Admin has reset the game.");
+                return Results.Json(new { message = "Game has been reset." });
+            });
+
             app.MapPost("/admin/incMaxRounds", (HttpRequest request, GameState gs) =>
             {
                 if (!IsAdminRequest(request, gs))
@@ -813,22 +862,9 @@ public class Program
             // POST "/admin/kickPlayer" => Kicks a player
             app.MapPost("/admin/kickPlayer", async (HttpRequest request, GameState gs) =>
             {
-                // Extract admin ID from headers
-                if (!request.Headers.TryGetValue("Admin-Id", out var adminIdHeaders))
+                if (!IsAdminRequest(request, gs))
                 {
-                    return Results.Json(new { message = "Admin ID missing." }, statusCode: 400);
-                }
-
-                var adminIdStr = adminIdHeaders.FirstOrDefault();
-                if (!Guid.TryParse(adminIdStr, out Guid adminId) || !gs.Players.ContainsKey(adminId))
-                {
-                    return Results.Json(new { message = "Invalid Admin ID." }, statusCode: 400);
-                }
-
-                var adminPlayer = gs.Players[adminId];
-                if (!adminPlayer.IsAdmin)
-                {
-                    return Results.Json(new { message = "Unauthorized." }, statusCode: 403);
+                    return Results.Json(new { message = "Forbidden." }, statusCode: 403);
                 }
 
                 // Read the form data for playerId to kick
@@ -839,18 +875,13 @@ public class Program
                     if (gs.Players.ContainsKey(playerId))
                     {
                         var player = gs.Players[playerId];
-                        if (player.IsAdmin)
-                        {
-                            return Results.Json(new { message = "Cannot kick admin player." }, statusCode: 400);
-                        }
-
-                        // Check if the player is already dead or kicked
                         if (player.Role == PlayerRole.DEAD)
                         {
                             return Results.Json(new { message = "Player is already dead." }, statusCode: 400);
                         }
 
                         gs.KickPlayer(playerId);
+                        Console.WriteLine($"Player kicked successfully: {player.Name} (ID: {player.Id})");
                         return Results.Json(new { message = "Player kicked successfully." });
                     }
                     else
@@ -873,6 +904,15 @@ public class Program
                 return Results.Ok();
             });
 
+            // Reset Game via GET for testing (optional)
+            /*
+            app.MapGet("/reset", (GameState gs) =>
+            {
+                gs.ResetGame();
+                return Results.Content("Game has been reset.", "text/plain");
+            });
+            */
+
             app.Run("http://0.0.0.0:8080");
         }
         catch (Exception ex)
@@ -891,11 +931,7 @@ public class Program
             if (!Guid.TryParse(idStr, out Guid playerId))
                 return false;
 
-            if (!gs.Players.ContainsKey(playerId))
-                return false;
-
-            var player = gs.Players[playerId];
-            return player.Name.ToLower() == "server";
+            return playerId == AdminId;
         }
 
         // HTML generator for name form
@@ -908,6 +944,16 @@ public class Program
     <head>
         <meta name='viewport' content='width=device-width, initial-scale=1.0' />
         <title>Register</title>
+        <script>
+            function adminLogin() {{
+                var password = prompt('Enter admin password:');
+                if (password === 'password') {{
+                    window.location.href = '/?id={AdminId}';
+                }} else {{
+                    alert('Incorrect password.');
+                }}
+            }}
+        </script>
     </head>
     <body>
         {message}
@@ -916,6 +962,48 @@ public class Program
             <input type='text' name='playerName' placeholder='Your Name' required />
             <button type='submit'>Submit</button>
         </form>
+        <hr/>
+        <button onclick='adminLogin()'>Admin Login</button>
+    </body>
+    </html>
+    ";
+        }
+
+        static string GenerateIntermediatePageHtml(Player p)
+        {
+            return $@"
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+        <title>Loading...</title>
+        <script>
+            setTimeout(() => {{
+                window.location.href = '/?id={p.Id}';
+            }}, 3000); // 3 seconds delay
+        </script>
+    </head>
+    <body>
+        <h1>Loading your roles...</h1>
+        <p>Health: {p.Health}</p>
+        <p>Please wait while roles are being assigned.</p>
+        <div class='spinner'></div>
+        <style>
+            .spinner {{
+                border: 16px solid #f3f3f3;
+                border-top: 16px solid #3498db;
+                border-radius: 50%;
+                width: 60px;
+                height: 60px;
+                animation: spin 2s linear infinite;
+                margin: auto;
+            }}
+
+            @keyframes spin {{
+                0% {{ transform: rotate(0deg); }}
+                100% {{ transform: rotate(360deg); }}
+            }}
+        </style>
     </body>
     </html>
     ";
@@ -940,9 +1028,13 @@ public class Program
                 return $@"
     <!DOCTYPE html>
     <html>
-    <head><meta name='viewport' content='width=device-width, initial-scale=1.0' /></head>
+    <head>
+        <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+        <title>Winner</title>
+    </head>
     <body>
         <h1>Congratulations, {p.Name}! You have won!</h1>
+        <p>Health: {p.Health}</p>
     </body>
     </html>
     ";
@@ -952,7 +1044,10 @@ public class Program
                 return $@"
     <!DOCTYPE html>
     <html>
-    <head><meta name='viewport' content='width=device-width, initial-scale=1.0' /></head>
+    <head>
+        <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+        <title>Dead</title>
+    </head>
     <body>
         <h2>Sorry {p.Name}, you are dead.</h2>
         <p>Health: {p.Health}</p>
@@ -984,7 +1079,7 @@ public class Program
                 }
                 else
                 {
-                    content += "<p>Waiting for others to finish...</p>";
+                    content += "<p>Waiting for other players to submit...</p>";
                 }
             }
             else
@@ -1002,134 +1097,152 @@ public class Program
                             body: `playerId=" + p.Id + @"`
                         });
                     }, 30000); // every 30 seconds
+
+                    // Auto-refresh to update health and roles
+                    setInterval(() => {
+                        window.location.reload();
+                    }, 5000); // every 5 seconds
                 </script>";
 
             return $@"
-                <!DOCTYPE html>
-                <html>
-                <head><meta name='viewport' content='width=device-width, initial-scale=1.0' /></head>
-                <body>
-                    <h1>Welcome, {p.Name}</h1>
-                    {content}
-                    {heartbeatScript}
-                </body>
-                </html>
-                ";
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+            <title>Game Page</title>
+        </head>
+        <body>
+            <h1>Welcome, {p.Name}</h1>
+            {content}
+            {heartbeatScript}
+        </body>
+        </html>
+        ";
+        }
+
+        // HTML generator for admin dashboard
+        static string GenerateAdminDashboardHtml(GameState gs)
+        {
+            StringBuilder playerListHtml = new StringBuilder();
+            playerListHtml.Append("<h2>Player List</h2>");
+            playerListHtml.Append("<table border='1' cellpadding='5' cellspacing='0'>");
+            playerListHtml.Append("<tr><th>Name</th><th>Role</th><th>Health</th><th>Action</th></tr>");
+
+            foreach (var player in gs.Players.Values)
+            {
+                if (player.Role == PlayerRole.DEAD) continue; // Optionally exclude dead players
+                playerListHtml.Append($@"
+                <tr>
+                    <td>{player.Name}</td>
+                    <td>{player.Role}</td>
+                    <td>{player.Health}</td>
+                    <td>
+                        <button type='button' onclick='kickPlayer(""{player.Id}"")'>Kick</button>
+                    </td>
+                </tr>");
+            }
+
+            playerListHtml.Append("</table>");
+
+            // Admin controls: Start Game, Reset Game, Increment MaxRounds, Decrement MaxRounds
+            string controls = $@"
+            <h2>Admin Controls</h2>
+            <div id='startResetButtons'>
+                {(gs.GameStarted ? "<button type='button' onclick='resetGame()'>Reset Game</button>" :
+                "<button type='button' onclick='startGame()'>Start Game</button>")}
+            </div>
+            <button type='button' onclick='increaseMaxRounds()'>Increase Max Rounds</button>
+            <button type='button' onclick='decreaseMaxRounds()'>Decrease Max Rounds</button>
+            <p>Current Max Rounds: <span id='maxRounds'>{gs.MaxRounds}</span></p>
+            <p>Game Status: {(gs.GameStarted ? "Started" : "Not Started")}</p>
+            <p>Player Count: {gs.Players.Count}</p>
+
+            <script>
+            function startGame() {{
+                fetch('/admin/startGame?id={AdminId}', {{ method: 'POST' }})
+                    .then(response => response.json())
+                    .then(data => {{
+                        alert(data.message);
+                        location.reload();
+                    }})
+                    .catch(error => console.error('Error:', error));
+            }}
+
+            function resetGame() {{
+                if (confirm('Are you sure you want to reset the game? This will kick all players and reset all settings.')) {{
+                    fetch('/admin/resetGame?id={AdminId}', {{ method: 'POST' }})
+                        .then(response => response.json())
+                        .then(data => {{
+                            alert(data.message);
+                            location.reload();
+                        }})
+                        .catch(error => console.error('Error:', error));
+                }}
+            }}
+
+            function increaseMaxRounds() {{
+                fetch('/admin/incMaxRounds?id={AdminId}', {{ method: 'POST' }})
+                    .then(response => response.json())
+                    .then(data => {{
+                        document.getElementById('maxRounds').innerText = data.newMaxRounds;
+                    }})
+                    .catch(error => console.error('Error:', error));
+            }}
+
+            function decreaseMaxRounds() {{
+                fetch('/admin/decMaxRounds?id={AdminId}', {{ method: 'POST' }})
+                    .then(response => response.json())
+                    .then(data => {{
+                        document.getElementById('maxRounds').innerText = data.newMaxRounds;
+                    }})
+                    .catch(error => console.error('Error:', error));
+            }}
+
+            function kickPlayer(playerId) {{
+                if (confirm('Are you sure you want to kick this player?')) {{
+                    // Disable the button to prevent spamming
+                    event.target.disabled = true;
+
+                    fetch('/admin/kickPlayer?id={AdminId}', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/x-www-form-urlencoded'
+                        }},
+                        body: `playerId=${{playerId}}`
+                    }})
+                    .then(response => response.json())
+                    .then(data => {{
+                        alert(data.message);
+                        location.reload();
+                    }})
+                    .catch(error => {{
+                        console.error('Error:', error);
+                        event.target.disabled = false; // Re-enable if there's an error
+                    }});
+                }}
+            }}
+
+            // Auto-refresh the admin dashboard every 30 seconds
+            setInterval(() => {{
+                location.reload();
+            }}, 30000);
+            </script>
+            ";
+
+            return $@"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+                <title>Admin Dashboard</title>
+            </head>
+            <body>
+                <h1>Admin Dashboard</h1>
+                {playerListHtml}
+                {controls}
+            </body>
+            </html>
+            ";
         }
     }
-
-     // HTML generator for admin dashboard
-    static string GenerateAdminDashboardHtml(GameState gs)
-{
-    StringBuilder playerListHtml = new StringBuilder();
-    playerListHtml.Append("<h2>Player List</h2>");
-    playerListHtml.Append("<table border='1' cellpadding='5' cellspacing='0'>");
-    playerListHtml.Append("<tr><th>Name</th><th>Role</th><th>Health</th><th>Action</th></tr>");
-
-    foreach (var player in gs.Players.Values)
-    {
-        if (player.IsAdmin) continue; // Exclude admin players
-        playerListHtml.Append($@"
-        <tr>
-            <td>{player.Name}</td>
-            <td>{player.Role}</td>
-            <td>{player.Health}</td>
-            <td>
-                <button type='button' onclick='kickPlayer(""{player.Id}"")'>Kick</button>
-            </td>
-        </tr>");
-    }
-
-    playerListHtml.Append("</table>");
-
-    // Retrieve admin's ID
-    var adminPlayer = gs.Players.Values.FirstOrDefault(p => p.IsAdmin);
-    string adminId = adminPlayer != null ? adminPlayer.Id.ToString() : "";
-
-    // Admin controls: Start Game, Increment MaxRounds, Decrement MaxRounds
-    string controls = $@"
-    <h2>Admin Controls</h2>
-    <button type='button' onclick='startGame()'>Start Game</button>
-    <button type='button' onclick='increaseMaxRounds()'>Increase Max Rounds</button>
-    <button type='button' onclick='decreaseMaxRounds()'>Decrease Max Rounds</button>
-    <p>Current Max Rounds: <span id='maxRounds'>{gs.MaxRounds}</span></p>
-
-    <script>
-    function startGame() {{
-        fetch('/admin/startGame', {{ method: 'POST' }})
-            .then(response => response.json())
-            .then(data => {{
-                alert(data.message);
-                location.reload();
-            }})
-            .catch(error => console.error('Error:', error));
-    }}
-
-    function increaseMaxRounds() {{
-        fetch('/admin/incMaxRounds', {{ method: 'POST' }})
-            .then(response => response.json())
-            .then(data => {{
-                alert(data.message);
-                document.getElementById('maxRounds').innerText = data.newMaxRounds;
-            }})
-            .catch(error => console.error('Error:', error));
-    }}
-
-    function decreaseMaxRounds() {{
-        fetch('/admin/decMaxRounds', {{ method: 'POST' }})
-            .then(response => response.json())
-            .then(data => {{
-                alert(data.message);
-                document.getElementById('maxRounds').innerText = data.newMaxRounds;
-            }})
-            .catch(error => console.error('Error:', error));
-    }}
-
-    function kickPlayer(playerId) {{
-        if (confirm('Are you sure you want to kick this player?')) {{
-            // Disable the button to prevent spamming
-            event.target.disabled = true;
-
-            fetch('/admin/kickPlayer', {{
-                method: 'POST',
-                headers: {{
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Admin-Id': '{adminId}'
-                }},
-                body: `playerId=${{playerId}}`
-            }})
-            .then(response => response.json())
-            .then(data => {{
-                alert(data.message);
-                location.reload();
-            }})
-            .catch(error => {{
-                console.error('Error:', error);
-                event.target.disabled = false; // Re-enable if there's an error
-            }});
-        }}
-    }}
-
-    // Auto-refresh the admin dashboard every 30 seconds
-    setInterval(() => {{
-        location.reload();
-    }}, 3000);
-    </script>
-    ";
-
-    return $@"
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name='viewport' content='width=device-width, initial-scale=1.0' />
-        <title>Admin Dashboard</title>
-    </head>
-    <body>
-        <h1>Admin Dashboard</h1>
-        {playerListHtml}
-        {controls}
-    </body>
-    </html>
-    ";
-}
 }
